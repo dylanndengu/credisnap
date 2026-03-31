@@ -10,18 +10,26 @@ State machine:
 │    → create user (consent=FALSE), send POPIA consent request        │
 ├─────────────────────────────────────────────────────────────────────┤
 │  User exists, consent=FALSE                                         │
-│    body="YES" → grant consent, send welcome message                 │
+│    body="YES" → grant consent, set onboarding_step=BUSINESS_NAME    │
 │    anything else → resend consent request                           │
 ├─────────────────────────────────────────────────────────────────────┤
-│  User has consent, media attachment                                 │
+│  onboarding_step=BUSINESS_NAME                                      │
+│    → save business_name, set step=TAX_REF                           │
+│    → ask for SARS income tax reference                              │
+├─────────────────────────────────────────────────────────────────────┤
+│  onboarding_step=TAX_REF                                            │
+│    body="SKIP" → skip, set step=DONE, send welcome                  │
+│    anything else → save income_tax_ref, set step=DONE, send welcome │
+├─────────────────────────────────────────────────────────────────────┤
+│  onboarding_step=DONE, media attachment                             │
 │    → create document row, download+upload to S3, run pipeline       │
 │    → send "Processing your receipt..." acknowledgement              │
 ├─────────────────────────────────────────────────────────────────────┤
-│  User has consent, text = "YES" / "CONFIRM"                         │
+│  onboarding_step=DONE, text = "YES" / "CONFIRM"                     │
 │    → find most recent DRAFT journal entry, post it                  │
 │    → send "Confirmed and posted" message                            │
 ├─────────────────────────────────────────────────────────────────────┤
-│  User has consent, text = "NO" / "REJECT"                           │
+│  onboarding_step=DONE, text = "NO" / "REJECT"                       │
 │    → find most recent DRAFT journal entry, mark FAILED              │
 │    → send "Discarded" message                                       │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -71,7 +79,17 @@ _MSG_CONSENT = (
 )
 
 _MSG_CONSENT_GRANTED = (
-    "Thank you! You're all set. 🎉\n\n"
+    "Thank you! Let's set up your account. 🎉\n\n"
+    "What is your business name?"
+)
+
+_MSG_ASK_TAX_REF = (
+    "Got it! One more question — what is your SARS income tax reference number?\n\n"
+    "This helps lenders verify your tax standing. Reply *SKIP* if you don't have one."
+)
+
+_MSG_ONBOARDING_DONE = (
+    "You're all set! 🎉\n\n"
     "Send me a photo or PDF of any receipt or invoice and I'll "
     "automatically record it in your books.\n\n"
     "When you're ready to view your financial statements, type *REPORT*."
@@ -135,7 +153,7 @@ async def _ensure_user(conn: asyncpg.Connection, whatsapp_number: str) -> dict:
     The new record has popia_consent_given=FALSE — nothing is processed until consent.
     """
     row = await conn.fetchrow(
-        "SELECT id, popia_consent_given FROM users WHERE whatsapp_number = $1",
+        "SELECT id, popia_consent_given, onboarding_step FROM users WHERE whatsapp_number = $1",
         whatsapp_number,
     )
     if row:
@@ -149,10 +167,10 @@ async def _ensure_user(conn: asyncpg.Connection, whatsapp_number: str) -> dict:
         RETURNING id
         """,
         whatsapp_number,
-        "Unknown Business",   # Updated later via onboarding flow (Step 7)
+        "Unknown Business",
     )
     log.info("Created new user %s for %s", user_id, whatsapp_number)
-    return {"id": user_id, "popia_consent_given": False}
+    return {"id": user_id, "popia_consent_given": False, "onboarding_step": None}
 
 
 async def _grant_consent(conn: asyncpg.Connection, user_id: UUID) -> None:
@@ -162,11 +180,45 @@ async def _grant_consent(conn: asyncpg.Connection, user_id: UUID) -> None:
             popia_consent_given   = TRUE,
             popia_consent_at      = NOW(),
             popia_consent_version = '1.0',
-            data_retention_until  = (CURRENT_DATE + INTERVAL '5 years')::date,
+            data_retention_until  = (CURRENT_DATE + INTERVAL '7 years')::date,
+            onboarding_step       = 'BUSINESS_NAME',
             updated_at            = NOW()
         WHERE id = $1
         """,
         user_id,
+    )
+
+
+async def _save_business_name(
+    conn: asyncpg.Connection, user_id: UUID, business_name: str
+) -> None:
+    await conn.execute(
+        """
+        UPDATE users SET
+            business_name   = $2,
+            onboarding_step = 'TAX_REF',
+            updated_at      = NOW()
+        WHERE id = $1
+        """,
+        user_id,
+        business_name.strip(),
+    )
+
+
+async def _save_tax_ref(
+    conn: asyncpg.Connection, user_id: UUID, tax_ref: str | None
+) -> None:
+    """Save income tax reference (may be None if the user skipped) and mark onboarding done."""
+    await conn.execute(
+        """
+        UPDATE users SET
+            income_tax_ref  = $2,
+            onboarding_step = 'DONE',
+            updated_at      = NOW()
+        WHERE id = $1
+        """,
+        user_id,
+        tax_ref,
     )
 
 
@@ -329,7 +381,26 @@ async def handle_message(form_data: dict) -> None:
             return
 
         # ------------------------------------------------------------------
-        # Consented user — route by message type
+        # Onboarding flow
+        # ------------------------------------------------------------------
+        onboarding_step = user.get("onboarding_step")
+
+        if onboarding_step == "BUSINESS_NAME":
+            if not body:
+                twilio_client.send_whatsapp(from_number, "Please enter your business name.")
+                return
+            await _save_business_name(conn, user_id, body)
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_TAX_REF)
+            return
+
+        if onboarding_step == "TAX_REF":
+            tax_ref = None if body.strip().upper() == "SKIP" else body.strip()
+            await _save_tax_ref(conn, user_id, tax_ref)
+            twilio_client.send_whatsapp(from_number, _MSG_ONBOARDING_DONE)
+            return
+
+        # ------------------------------------------------------------------
+        # Fully onboarded user — route by message type
         # ------------------------------------------------------------------
         if num_media > 0:
             try:

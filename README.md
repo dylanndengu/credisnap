@@ -65,17 +65,16 @@ Inbound WhatsApp messages are handled through a state machine in `message_handle
 - **`YES` / `NO` reply** → looks up the user's most recent `DRAFT` journal entry; `YES` fires the `UPDATE status='POSTED'` (triggering the DB balance check); `NO` deletes the entry and marks the document `REJECTED`.
 - **Security** — `router.py` validates the `X-Twilio-Signature` header on every request before any processing. Invalid signatures return HTTP 403. The background task pattern (FastAPI `BackgroundTasks`) ensures Twilio always gets a `200` within its 15-second timeout.
 
-### Step 4 — Financial Statement Generation 🔲
+### Step 4 — User Onboarding Flow ✅
+*Files: [`db/migrations/004_onboarding_step.sql`](db/migrations/004_onboarding_step.sql), [`app/whatsapp/message_handler.py`](app/whatsapp/message_handler.py)*
 
-Receive inbound WhatsApp messages via Twilio/Turn.io, extract the media attachment, upload to S3, and create a `documents` row with status `PENDING`.
+A two-step onboarding flow triggered immediately after POPIA consent is granted:
 
-### Step 3 — OCR + Extraction Pipeline 🔲
-
-Trigger AWS Textract on the S3 object, parse the response, and use an LLM to map line items to Chart of Accounts codes. Write the structured output back to `documents.extracted_data`.
-
-### Step 4 — Journal Entry Generation 🔲
-
-Convert the extracted document data into a balanced journal entry (header + lines). Auto-post high-confidence entries; queue low-confidence ones for user confirmation via WhatsApp reply.
+- **`onboarding_step` column** ([`004_onboarding_step.sql`](db/migrations/004_onboarding_step.sql)) — Adds a `BUSINESS_NAME → TAX_REF → DONE` enum to `users`. `NULL` on existing rows is treated as `DONE` so legacy users are unaffected.
+- **Business name** (mandatory) — Bot asks "What is your business name?" and saves the reply directly. Any non-empty text is accepted.
+- **SARS income tax reference** (optional) — Bot asks for the reference number with a `SKIP` escape hatch. Not all SA SMEs are formally tax-registered (~72% informal sector per FinScope MSME 2024), so this is intentionally skippable.
+- **Data retention** — Updated from 5 to 7 years on consent to cover both the SARS TAA s29 requirement (5 years) and the Companies Act s24/s28 requirement (7 years) for registered entities.
+- The onboarding block sits between the POPIA gate and the normal receipt-processing flow in the state machine — users in either onboarding step cannot send receipts until setup is complete.
 
 ### Step 5 — Financial Statement Generation 🔲
 
