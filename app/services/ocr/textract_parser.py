@@ -109,7 +109,10 @@ def parse(raw_response: dict[str, Any]) -> TextractExpense:
 
     Returns:
         TextractExpense with all extractable fields populated.
-        ocr_confidence is the minimum confidence across all used fields.
+        ocr_confidence is a weighted average: TOTAL (0.40) and VENDOR_NAME (0.25)
+        dominate; date (0.15), tax (0.10), VAT number (0.05), and avg line-item
+        confidence (0.20) contribute less. Missing fields are skipped and their
+        weight redistributed proportionally.
     """
     docs = raw_response.get("ExpenseDocuments", [])
     if not docs:
@@ -119,14 +122,9 @@ def parse(raw_response: dict[str, Any]) -> TextractExpense:
     doc = docs[0]
     summary = _extract_summary_fields(doc.get("SummaryFields", []))
 
-    confidence_scores: list[float] = []
-
     def get(key: str) -> str | None:
         entry = summary.get(key)
-        if entry:
-            confidence_scores.append(entry[1])
-            return entry[0]
-        return None
+        return entry[0] if entry else None
 
     # Vendor name
     vendor_name = get(_VENDOR_NAME)
@@ -158,7 +156,6 @@ def parse(raw_response: dict[str, Any]) -> TextractExpense:
     line_item_tuples = _parse_line_items(doc.get("LineItemGroups", []))
     line_items   = [item for item, _ in line_item_tuples]
     line_confs   = [conf for _, conf in line_item_tuples]
-    confidence_scores.extend(line_confs)
 
     # If Textract returned no line items, synthesise one from the total
     # so the pipeline can still attempt categorisation.
@@ -169,7 +166,33 @@ def parse(raw_response: dict[str, Any]) -> TextractExpense:
             gross_amount=gross_total,
         )]
 
-    ocr_confidence = min(confidence_scores) if confidence_scores else 0.5
+    # Weighted confidence: critical fields (TOTAL, VENDOR_NAME) dominate;
+    # ancillary fields (date, VAT number, invoice ID) drag less.
+    # Line items are averaged separately and treated as one vote.
+    # Missing fields are skipped and their weight redistributed proportionally.
+    _FIELD_WEIGHTS = {
+        _TOTAL:       0.40,
+        _VENDOR_NAME: 0.25,
+        _DATE:        0.15,
+        _TAX:         0.10,
+        _VENDOR_VAT:  0.05,
+        _TAX_PAYER_ID:0.05,
+    }
+    weighted_sum   = 0.0
+    total_weight   = 0.0
+    for key, weight in _FIELD_WEIGHTS.items():
+        entry = summary.get(key)
+        if entry:
+            weighted_sum  += entry[1] * weight
+            total_weight  += weight
+
+    # Average line-item confidence counts as one 0.20-weight vote
+    if line_confs:
+        avg_line_conf  = sum(line_confs) / len(line_confs)
+        weighted_sum  += avg_line_conf * 0.20
+        total_weight  += 0.20
+
+    ocr_confidence = (weighted_sum / total_weight) if total_weight > 0 else 0.5
 
     return TextractExpense(
         vendor_name=vendor_name,

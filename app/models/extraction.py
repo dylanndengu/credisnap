@@ -127,7 +127,57 @@ class CategorisedExpense(BaseModel):
 
     def validate_line_totals(self) -> bool:
         """
-        Returns True if line items sum to the document gross total.
-        A mismatch means the receipt was partially parsed — safest to leave as DRAFT.
+        Returns True if line items sum to the document gross total (VAT-inclusive),
+        OR if they sum to the net total (gross / 1.15) — Textract often returns net
+        line prices when the receipt shows ex-VAT amounts with a bottom-line VAT entry.
+        A 2-cent tolerance handles rounding across many line items.
         """
-        return self.line_items_gross_total == self.gross_total
+        _TOLERANCE = Decimal("0.02")
+        line_sum = self.line_items_gross_total
+        if abs(line_sum - self.gross_total) <= _TOLERANCE:
+            return True
+        net_total = (self.gross_total / (1 + _VAT_RATE)).quantize(_CENT, ROUND_HALF_UP)
+        return abs(line_sum - net_total) <= _TOLERANCE
+
+    def with_grossed_up_line_items(self) -> "CategorisedExpense":
+        """
+        If Textract returned net (ex-VAT) line item amounts, scale each item
+        proportionally so they sum to gross_total. This ensures journal entries balance.
+        If items already sum to gross_total, returns self unchanged.
+        """
+        _TOLERANCE = Decimal("0.02")
+        line_sum = self.line_items_gross_total
+
+        if abs(line_sum - self.gross_total) <= _TOLERANCE:
+            return self  # already gross, nothing to do
+
+        net_total = (self.gross_total / (1 + _VAT_RATE)).quantize(_CENT, ROUND_HALF_UP)
+        if abs(line_sum - net_total) > _TOLERANCE:
+            return self  # neither gross nor net match — don't guess, leave for manual review
+
+        # Scale each item: new_gross = old_net_amount * (gross_total / net_total_sum)
+        scale = self.gross_total / line_sum
+        scaled_items = [
+            CategorisedLineItem(
+                description=item.description,
+                account_code=item.account_code,
+                vat_code=item.vat_code,
+                gross_amount=(item.gross_amount * scale).quantize(_CENT, ROUND_HALF_UP),
+                llm_reasoning=item.llm_reasoning,
+            )
+            for item in self.line_items
+        ]
+
+        # Fix any rounding residual on the last item so sum == gross_total exactly
+        residual = self.gross_total - sum(i.gross_amount for i in scaled_items)
+        if residual != Decimal("0"):
+            last = scaled_items[-1]
+            scaled_items[-1] = CategorisedLineItem(
+                description=last.description,
+                account_code=last.account_code,
+                vat_code=last.vat_code,
+                gross_amount=last.gross_amount + residual,
+                llm_reasoning=last.llm_reasoning,
+            )
+
+        return self.model_copy(update={"line_items": scaled_items})

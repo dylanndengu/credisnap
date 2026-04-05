@@ -56,7 +56,8 @@ from app.whatsapp import media_handler
 from app.services.ocr import textract_parser
 from app.services.categorisation import llm_categoriser
 from app.services.ledger import journal_writer
-from app.services.reporting import statement_generator
+from app.services.reporting import statement_generator, report_orchestrator
+from app.services.vision import receipt_checker
 
 import anthropic
 
@@ -366,6 +367,16 @@ async def _handle_media_message(
         log.warning("Unsupported media from %s: %s", from_number, exc)
         return
 
+    # 1b. Vision check — reject if the image contains multiple receipts
+    if receipt_checker.contains_multiple_receipts(content, mime_type):
+        twilio_client.send_whatsapp(
+            from_number,
+            "📸 It looks like your photo contains more than one receipt.\n\n"
+            "Please send one receipt at a time so I can record each one accurately."
+        )
+        log.info("Rejected multi-receipt image from %s", from_number)
+        return
+
     # 2. Create document row (status=PENDING)
     document_id: UUID = await conn.fetchval(
         """
@@ -642,15 +653,35 @@ async def handle_message(form_data: dict) -> None:
                 twilio_client.send_whatsapp(from_number, _MSG_REJECTION_OPTIONS)
             return
 
-        # REPORT keyword — generate financial statements
+        # REPORT keyword — generate PDF financial report
         if body.strip().upper() == "REPORT":
             try:
                 fy_end_month = user.get("financial_year_end_month") or 2
-                from_date, to_date = statement_generator.current_financial_year(fy_end_month)
-                pl, bs = await statement_generator.get_statements(conn, user_id, from_date, to_date)
-                msg = statement_generator.format_whatsapp_report(pl, bs)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "📊 Generating your financial report... this may take a moment."
+                )
+                result = await report_orchestrator.generate_and_deliver(
+                    conn, user_id, fy_end_month
+                )
+                if result is None:
+                    msg = (
+                        "No posted transactions found for this period yet.\n\n"
+                        "Upload a receipt and confirm it to see your financial statements."
+                    )
+                else:
+                    msg = (
+                        f"Your financial report is ready! 📊\n\n"
+                        f"*{result.business_name}*\n"
+                        f"Period: {result.from_date.strftime('%d %b %Y')} – "
+                        f"{result.to_date.strftime('%d %b %Y')}\n\n"
+                        f"Includes: Trial Balance, General Ledger, P&L, "
+                        f"Balance Sheet, VAT201 Summary & Vendor Statements.\n\n"
+                        f"Download your PDF (link expires in 24 hours):\n"
+                        f"{result.presigned_url}"
+                    )
             except Exception:
-                log.exception("Failed to generate report for %s", from_number)
+                log.exception("Failed to generate PDF report for %s", from_number)
                 msg = "Sorry, I couldn't generate your report right now. Please try again."
             twilio_client.send_whatsapp(from_number, msg)
             return

@@ -142,6 +142,11 @@ async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
             )
 
             # --------------------------------------------------------------
+            # 5b. Normalise line item amounts to gross if Textract returned net
+            # --------------------------------------------------------------
+            expense_categorised = expense_categorised.with_grossed_up_line_items()
+
+            # --------------------------------------------------------------
             # 6. Write journal entry
             # --------------------------------------------------------------
             entry_id = await journal_writer.write(
