@@ -65,7 +65,7 @@ async def download_media(media_url: str, content_type: str) -> tuple[bytes, str]
             f"Allowed: {', '.join(sorted(_ALLOWED_MIME_TYPES))}"
         )
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         response = await client.get(
             media_url,
             auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),

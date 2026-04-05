@@ -69,6 +69,8 @@ if __name__ == "__main__":
     print(f"                 → Send a WhatsApp message")
     print(f"                 → Sandbox settings → paste URL above\n")
 
+    sys.stdout.flush()
+
     # Start uvicorn
     uvicorn.run(
         "app.main:app",

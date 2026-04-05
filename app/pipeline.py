@@ -17,6 +17,7 @@ and any rollback are always consistent with the journal write.
 
 from __future__ import annotations
 
+import json
 import logging
 from uuid import UUID
 
@@ -110,8 +111,8 @@ async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
                 WHERE id = $1
                 """,
                 document_id,
-                expense_raw.raw_json,
-                {"line_items": [li.model_dump() for li in expense_raw.line_items]},
+                json.dumps(expense_raw.raw_json),
+                json.dumps({"line_items": [li.model_dump() for li in expense_raw.line_items]}, default=str),
                 expense_raw.ocr_confidence,
                 expense_raw.vendor_name,
                 expense_raw.document_date,

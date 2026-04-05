@@ -76,18 +76,52 @@ A two-step onboarding flow triggered immediately after POPIA consent is granted:
 - **Data retention** — Updated from 5 to 7 years on consent to cover both the SARS TAA s29 requirement (5 years) and the Companies Act s24/s28 requirement (7 years) for registered entities.
 - The onboarding block sits between the POPIA gate and the normal receipt-processing flow in the state machine — users in either onboarding step cannot send receipts until setup is complete.
 
-### Step 5 — Financial Statement Generation 🔲
+### Step 5 — Financial Statement Generation ✅
+*Files: [`app/services/reporting/statement_generator.py`](app/services/reporting/statement_generator.py), [`app/whatsapp/message_handler.py`](app/whatsapp/message_handler.py)*
 
-Query `v_account_balances` to produce a formatted P&L and Balance Sheet for a given date range. Output as WhatsApp message (summary) and PDF (full report).
+Users type *REPORT* to receive a formatted P&L and Balance Sheet for their current financial year to date:
 
-### Step 6 — FastAPI Application Shell 🔲
+- **`statement_generator.get_statements`** — queries `v_account_balances` for the user's financial year (driven by `financial_year_end_month` on the user row). Returns structured `ProfitAndLoss` and `BalanceSheet` dataclasses.
+- **P&L** — Revenue, Cost of Sales, Gross Profit, Operating Expenses, Finance Costs, Net Profit.
+- **Balance Sheet** — Current Assets, Non-Current Assets, Current Liabilities, Non-Current Liabilities, Equity, Net Assets.
+- **`format_whatsapp_report`** — formats both statements as a single WhatsApp-friendly text message with ZAR amounts (brackets for negatives). Returns a "no data yet" message if no posted transactions exist.
+- Financial year boundaries are computed automatically from `fy_end_month` — supports any non-calendar year-end as allowed by SARS.
+
+### Step 6 — Expanded Chart of Accounts ✅
+*Files: [`db/migrations/005_expand_chart_of_accounts.sql`](db/migrations/005_expand_chart_of_accounts.sql), [`app/services/categorisation/llm_categoriser.py`](app/services/categorisation/llm_categoriser.py)*
+
+Added 10 commonly-used SA SME expense codes missing from the initial seed:
+
+- `6200` IT and Software Subscriptions
+- `6210` Entertainment and Client Gifts *(50% VAT input limitation — VAT Act s17(2))*
+- `6220` Training and Staff Development
+- `6230` Cleaning and Pest Control
+- `6240` Security and Alarm
+- `6250` Packaging and Consumables
+- `6260` Courier and Postage
+- `6270` Subscriptions and Memberships
+- `6280` Skills Development Levy *(VAT: OP — payroll levy)*
+- `6290` COIDA / Workmen's Compensation *(VAT: OP — payroll levy)*
+
+The LLM categoriser system prompt was updated to match. Prompt injection hardening added: receipt data is wrapped in `<receipt>` XML tags with an explicit guard instruction.
+
+### Step 7 — Receipt Rejection & Re-categorisation Flow ✅
+*Files: [`db/migrations/006_conversation_state.sql`](db/migrations/006_conversation_state.sql), [`app/whatsapp/message_handler.py`](app/whatsapp/message_handler.py), [`app/services/categorisation/llm_categoriser.py`](app/services/categorisation/llm_categoriser.py)*
+
+When a user replies *NO* to a DRAFT journal entry, instead of silently discarding it they are guided through a structured rejection flow:
+
+- **Option 1 — Wrong category** → bot asks the user to describe the expense in plain English; the original Textract OCR is re-used and re-categorised by the LLM with the user's hint, producing a new DRAFT or auto-posted entry.
+- **Option 2 — Wrong amount** → entry discarded, user prompted to re-upload a clearer photo.
+- **Option 3 — Not a business expense** → entry discarded silently.
+
+State is tracked via a `conversation_state` enum column (`AWAITING_REJECTION_REASON` → `AWAITING_CATEGORY_HINT`) added to the `users` table. The `llm_categoriser.categorise()` function accepts an optional `hint` string that is appended to the user message, improving categorisation accuracy for ambiguous receipts.
+
+Confirmation messages now show the proposed account categories and amounts so users can make an informed YES/NO decision.
+
+### Step 8 — FastAPI Application Shell 🔲
 
 Project structure, configuration management, database connection layer, and dependency injection wiring all components together.
 
-### Step 7 — Authentication & Security 🔲
-
-WhatsApp number verification, POPIA consent gate on first message, rate limiting, and S3 pre-signed URL handling.
-
-### Step 8 — Deployment 🔲
+### Step 9 — Deployment 🔲
 
 Dockerised application, environment configuration, AWS infrastructure (RDS PostgreSQL, S3 bucket, Textract IAM roles), and CI/CD pipeline.
