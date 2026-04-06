@@ -274,23 +274,27 @@ def _general_ledger(data: FullReportData) -> list:
         # Opening balance row
         if acct.opening_balance != 0:
             rows.append([
-                "", "Opening Balance", "", "", "", _zar(acct.opening_balance)
+                "", Paragraph("<i>Opening Balance</i>", _S["body"]), "", "", "",
+                Paragraph(_zar(acct.opening_balance), _S["body_right"]),
             ])
 
         for line in acct.lines:
             rows.append([
                 _dt(line.entry_date),
-                line.description[:55] + ("…" if len(line.description) > 55 else ""),
-                (line.vendor_name or "")[:20],
-                _zar(line.debit)  if line.debit  else "—",
-                _zar(line.credit) if line.credit else "—",
-                _zar(line.running_balance),
+                Paragraph(line.description, _S["body"]),
+                Paragraph(line.vendor_name or "", _S["body"]),
+                Paragraph(_zar(line.debit),  _S["body_right"]) if line.debit  else "—",
+                Paragraph(_zar(line.credit), _S["body_right"]) if line.credit else "—",
+                Paragraph(_zar(line.running_balance), _S["body_right"]),
             ])
 
         # Closing balance row
-        rows.append(["", "Closing Balance", "", "", "", _zar(acct.closing_balance)])
+        rows.append([
+            "", Paragraph("<b>Closing Balance</b>", _S["body"]), "", "", "",
+            Paragraph(f"<b>{_zar(acct.closing_balance)}</b>", _S["body_right"]),
+        ])
 
-        col_w = [1.8*cm, 6*cm, 2.5*cm, 2.3*cm, 2.3*cm, 2.3*cm]
+        col_w = [1.8*cm, 5.5*cm, 3*cm, 2.3*cm, 2.3*cm, 2.3*cm]
         tbl = Table(rows, colWidths=col_w, repeatRows=1)
         tbl.setStyle(_tbl_style([
             ("ALIGN",      (3, 0), (-1, -1), "RIGHT"),
@@ -334,7 +338,19 @@ def _pl(pl: ProfitAndLoss) -> list:
         story.append(tbl)
         story.append(Spacer(1, 0.2 * cm))
 
-    section("Revenue", pl.revenue + pl.other_income, "Total Revenue", pl.total_revenue)
+    revenue_lines = pl.revenue + pl.other_income
+    if revenue_lines:
+        section("Revenue", revenue_lines, "Total Revenue", pl.total_revenue)
+    else:
+        story.append(Paragraph("Revenue", _S["sub_head"]))
+        story.append(Paragraph(
+            "No revenue recorded in this period. "
+            "Revenue entries are created when sales invoices are uploaded.",
+            _S["body"]
+        ))
+        story.append(Paragraph(f"<b>Total Revenue: {_zar(pl.total_revenue)}</b>", _S["body"]))
+        story.append(Spacer(1, 0.2 * cm))
+
     section("Cost of Sales", pl.cost_of_sales, "Total Cost of Sales", pl.total_cost_of_sales)
 
     story.append(Paragraph(
@@ -458,30 +474,35 @@ def _vat201(periods: list[Vat201Period], detail: list[Vat201DetailLine]) -> list
 
 def _vendor_statements(vendors: list[VendorStatement]) -> list:
     story = [
-        Paragraph("VENDOR STATEMENTS OF ACCOUNT", _S["section_head"]),
-        Paragraph("Spend history per supplier based on posted receipts and invoices.", _S["body"]),
+        Paragraph("SUPPLIER STATEMENTS OF ACCOUNT", _S["section_head"]),
+        Paragraph(
+            "Amounts your business paid to each supplier — based on posted receipts and invoices. "
+            "These are outgoing payments (expenses). Customer receipts (income) are not shown here.",
+            _S["body"]
+        ),
         _hr(),
     ]
 
     if not vendors:
-        story.append(Paragraph("No vendor transactions in this period.", _S["body"]))
+        story.append(Paragraph("No supplier transactions in this period.", _S["body"]))
         return story
 
     for vendor in vendors:
-        story.append(Paragraph(vendor.vendor_name, _S["sub_head"]))
-        rows = [["Date", "Description", "Invoice No.", "VAT (R)", "Gross (R)"]]
+        story.append(Paragraph(f"PAID TO: {vendor.vendor_name}", _S["sub_head"]))
+        rows = [["Date", "Description", "Invoice No.", "VAT (R)", "Amount Paid (R)"]]
         for t in vendor.transactions:
             rows.append([
                 _dt(t.entry_date),
-                t.description[:50] + ("…" if len(t.description) > 50 else ""),
+                Paragraph(t.description, _S["body"]),
                 t.invoice_number or "—",
-                _zar(t.vat_amount) if t.vat_amount else "—",
-                _zar(t.gross_amount),
+                Paragraph(_zar(t.vat_amount), _S["body_right"]) if t.vat_amount else "—",
+                Paragraph(_zar(t.gross_amount), _S["body_right"]),
             ])
         rows.append([
-            "", f"<b>Total spend: {_zar(vendor.total_spend)}</b>", "", "", "",
+            "", Paragraph(f"<b>Total paid to supplier: {_zar(vendor.total_spend)}</b>", _S["body"]),
+            "", "", "",
         ])
-        col_w = [1.8*cm, 7*cm, 2.2*cm, 2.2*cm, 2.2*cm]
+        col_w = [1.8*cm, 6.5*cm, 2.2*cm, 2.2*cm, 2.5*cm]
         tbl = Table(rows, colWidths=col_w, repeatRows=1)
         tbl.setStyle(_tbl_style([
             ("ALIGN",    (3, 0),  (-1, -1), "RIGHT"),

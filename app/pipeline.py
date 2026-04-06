@@ -1,18 +1,25 @@
 """
-OCR → Categorisation → Ledger pipeline orchestrator.
+OCR → Classification → Categorisation → Ledger pipeline orchestrator.
 
-Entry point: process_document(document_id, raw_textract_json)
+Entry points:
+  process_document(document_id, raw_textract_json)
+      Full pipeline. Returns UUID of journal entry, or None if the document
+      type is uncertain and the user must be asked to clarify.
 
-Sequence:
-  1. Load document + user from DB, validate POPIA consent
-  2. Parse Textract JSON → TextractExpense
-  3. LLM categorise → CategorisedExpense
-  4. Write journal entry → UUID
-  5. Update document status (POSTED or EXTRACTED pending review)
-  6. On any failure: mark document FAILED and re-raise
+  resume_document_with_type(document_id, doc_type)
+      Resume a paused document (status=EXTRACTED, type unknown) after the user
+      has confirmed whether it is a PURCHASE or SALE.
 
-All DB state changes go through a single asyncpg connection so step 5
-and any rollback are always consistent with the journal write.
+Sequence (process_document):
+  1. Load document + user, validate POPIA consent
+  2. Parse Textract JSON → TextractExpense, persist metadata
+  3. Classify document type (PURCHASE / SALE / uncertain)
+     → If uncertain: return None — caller sends WhatsApp and sets conversation state
+  4. Categorise line items (expense or revenue categoriser)
+  5. Normalise line item amounts to gross if Textract returned net values
+  6. Write journal entry (purchase or sale writer)
+  7. Update document status (POSTED or EXTRACTED pending review)
+  8. On any failure: mark document FAILED and re-raise
 """
 
 from __future__ import annotations
@@ -25,38 +32,36 @@ import anthropic
 import asyncpg
 
 from app.db.connection import get_pool
-from app.services.categorisation import llm_categoriser
+from app.models.extraction import DocumentType, TextractExpense
+from app.services.categorisation import llm_categoriser, revenue_categoriser
+from app.services.classification import document_classifier
 from app.services.ledger import journal_writer
 from app.services.ocr import textract_parser
 
 log = logging.getLogger(__name__)
 
 
-async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
+async def process_document(
+    document_id: UUID,
+    raw_textract_json: dict,
+) -> UUID | None:
     """
     Run the full pipeline for a single uploaded document.
 
-    Args:
-        document_id:       UUID of the documents row (status must be EXTRACTED).
-        raw_textract_json: Full boto3 analyze_expense() response dict.
-
     Returns:
-        The UUID of the created journal_entry (DRAFT or POSTED).
+        UUID of the created journal_entry on success.
+        None if the document type is uncertain — the caller must ask the user.
 
     Raises:
-        ValueError          — invalid document state or missing data.
-        asyncpg.PostgresError — DB constraint violations (bubble up for retry logic).
+        ValueError            — invalid document state or missing data.
+        asyncpg.PostgresError — DB constraint violations.
     """
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        # ------------------------------------------------------------------
-        # 1. Load document and user
-        # ------------------------------------------------------------------
         row = await conn.fetchrow(
             """
-            SELECT d.id, d.user_id, d.status, u.popia_consent_given,
-                   u.vat_number IS NOT NULL AS is_vat_registered
+            SELECT d.id, d.user_id, d.status, u.popia_consent_given, u.business_name
             FROM   documents d
             JOIN   users     u ON u.id = d.user_id
             WHERE  d.id = $1
@@ -66,34 +71,25 @@ async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
 
         if row is None:
             raise ValueError(f"Document {document_id} not found")
-
         if not row["popia_consent_given"]:
-            raise ValueError(
-                f"User {row['user_id']} has not given POPIA consent — cannot process document"
-            )
-
+            raise ValueError(f"User {row['user_id']} has not given POPIA consent")
         if row["status"] not in ("EXTRACTED", "PENDING"):
             raise ValueError(
                 f"Document {document_id} has status {row['status']!r}; expected EXTRACTED or PENDING"
             )
 
-        user_id: UUID = row["user_id"]
+        user_id:       UUID = row["user_id"]
+        business_name: str  = row["business_name"] or ""
 
-        # ------------------------------------------------------------------
-        # 2. Mark document as PROCESSING
-        # ------------------------------------------------------------------
         await conn.execute(
             "UPDATE documents SET status = 'PROCESSING', updated_at = NOW() WHERE id = $1",
             document_id,
         )
 
         try:
-            # --------------------------------------------------------------
-            # 3. Parse Textract JSON
-            # --------------------------------------------------------------
+            # ── 2. Parse Textract ─────────────────────────────────────────
             expense_raw = textract_parser.parse(raw_textract_json)
 
-            # Write extracted metadata back to the document row
             await conn.execute(
                 """
                 UPDATE documents SET
@@ -123,62 +119,27 @@ async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
                     if expense_raw.tax_amount else None,
             )
 
-            # --------------------------------------------------------------
-            # 4. Fetch valid account codes for this user (passed to LLM validator)
-            # --------------------------------------------------------------
-            code_rows = await conn.fetch(
-                "SELECT code FROM accounts WHERE user_id = $1 AND is_active = TRUE",
-                user_id,
-            )
-            valid_codes = {r["code"] for r in code_rows}
-
-            # --------------------------------------------------------------
-            # 5. LLM categorisation
-            # --------------------------------------------------------------
-            expense_categorised = llm_categoriser.categorise(
+            # ── 3. Classify document type ─────────────────────────────────
+            anthropic_client = anthropic.Anthropic()
+            doc_type, confidence = document_classifier.classify(
                 expense=expense_raw,
-                valid_account_codes=valid_codes,
-                anthropic_client=anthropic.Anthropic(),
+                business_name=business_name,
+                anthropic_client=anthropic_client,
             )
 
-            # --------------------------------------------------------------
-            # 5b. Normalise line item amounts to gross if Textract returned net
-            # --------------------------------------------------------------
-            expense_categorised = expense_categorised.with_grossed_up_line_items()
+            if doc_type is None:
+                # Uncertain — leave document as EXTRACTED, signal caller to ask user
+                log.info(
+                    "Document %s classification uncertain (conf=%.2f) — pausing for user input",
+                    document_id, confidence,
+                )
+                return None
 
-            # --------------------------------------------------------------
-            # 6. Write journal entry
-            # --------------------------------------------------------------
-            entry_id = await journal_writer.write(
-                conn=conn,
-                user_id=user_id,
-                document_id=document_id,
-                expense=expense_categorised,
+            return await _categorise_and_write(
+                conn, user_id, document_id, expense_raw, doc_type, anthropic_client
             )
-
-            # --------------------------------------------------------------
-            # 7. Mark document POSTED (entry auto-posted) or back to EXTRACTED
-            #    (entry is DRAFT, awaiting WhatsApp confirmation)
-            # --------------------------------------------------------------
-            final_doc_status = (
-                "POSTED"
-                if expense_categorised.combined_confidence >= journal_writer.AUTO_POST_THRESHOLD
-                else "EXTRACTED"
-            )
-            await conn.execute(
-                "UPDATE documents SET status = $2, updated_at = NOW() WHERE id = $1",
-                document_id,
-                final_doc_status,
-            )
-
-            log.info(
-                "Document %s processed → journal entry %s (%s)",
-                document_id, entry_id, final_doc_status,
-            )
-            return entry_id
 
         except Exception as exc:
-            # Mark the document FAILED and store the error message
             await conn.execute(
                 """
                 UPDATE documents SET
@@ -193,3 +154,152 @@ async def process_document(document_id: UUID, raw_textract_json: dict) -> UUID:
             )
             log.exception("Pipeline failed for document %s", document_id)
             raise
+
+
+async def resume_document_with_type(
+    document_id: UUID,
+    doc_type: DocumentType,
+) -> UUID:
+    """
+    Resume processing a document whose type was confirmed by the user.
+
+    Reads the already-stored ocr_raw_json, runs categorisation + journal write
+    with the user-confirmed document type. Does not re-call Textract.
+
+    Returns:
+        UUID of the created journal_entry.
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT d.id, d.user_id, d.status, d.ocr_raw_json, u.popia_consent_given
+            FROM   documents d
+            JOIN   users     u ON u.id = d.user_id
+            WHERE  d.id = $1
+            """,
+            document_id,
+        )
+
+        if row is None:
+            raise ValueError(f"Document {document_id} not found")
+        if row["status"] not in ("EXTRACTED", "PROCESSING"):
+            raise ValueError(
+                f"Document {document_id} has unexpected status {row['status']!r}"
+            )
+        if not row["ocr_raw_json"]:
+            raise ValueError(f"Document {document_id} has no stored OCR data to resume from")
+
+        user_id = row["user_id"]
+        raw_json = row["ocr_raw_json"]
+        if isinstance(raw_json, str):
+            raw_json = json.loads(raw_json)
+
+        await conn.execute(
+            "UPDATE documents SET status = 'PROCESSING', updated_at = NOW() WHERE id = $1",
+            document_id,
+        )
+
+        try:
+            expense_raw = textract_parser.parse(raw_json)
+
+            # Persist the confirmed document type
+            await conn.execute(
+                "UPDATE documents SET document_type = $2::document_type, updated_at = NOW() WHERE id = $1",
+                document_id,
+                doc_type.value,
+            )
+
+            return await _categorise_and_write(
+                conn, user_id, document_id, expense_raw, doc_type, anthropic.Anthropic()
+            )
+
+        except Exception as exc:
+            await conn.execute(
+                """
+                UPDATE documents SET
+                    status        = 'FAILED',
+                    error_message = $2,
+                    retry_count   = retry_count + 1,
+                    updated_at    = NOW()
+                WHERE id = $1
+                """,
+                document_id,
+                str(exc),
+            )
+            log.exception("Resume failed for document %s", document_id)
+            raise
+
+
+async def _categorise_and_write(
+    conn: asyncpg.Connection,
+    user_id: UUID,
+    document_id: UUID,
+    expense_raw: TextractExpense,
+    doc_type: DocumentType,
+    anthropic_client: anthropic.Anthropic,
+) -> UUID:
+    """
+    Shared categorise → normalise → write path used by both process_document
+    and resume_document_with_type.
+    """
+    # Persist confirmed document type
+    await conn.execute(
+        "UPDATE documents SET document_type = $2::document_type, updated_at = NOW() WHERE id = $1",
+        document_id,
+        doc_type.value,
+    )
+
+    code_rows = await conn.fetch(
+        "SELECT code FROM accounts WHERE user_id = $1 AND is_active = TRUE",
+        user_id,
+    )
+    valid_codes = {r["code"] for r in code_rows}
+
+    if doc_type == DocumentType.SALE:
+        expense_categorised = revenue_categoriser.categorise(
+            expense=expense_raw,
+            valid_account_codes=valid_codes,
+            anthropic_client=anthropic_client,
+        )
+    else:
+        expense_categorised = llm_categoriser.categorise(
+            expense=expense_raw,
+            valid_account_codes=valid_codes,
+            anthropic_client=anthropic_client,
+        )
+
+    expense_categorised = expense_categorised.with_grossed_up_line_items()
+
+    if doc_type == DocumentType.SALE:
+        entry_id = await journal_writer.write_sale(
+            conn=conn,
+            user_id=user_id,
+            document_id=document_id,
+            expense=expense_categorised,
+        )
+    else:
+        entry_id = await journal_writer.write(
+            conn=conn,
+            user_id=user_id,
+            document_id=document_id,
+            expense=expense_categorised,
+        )
+
+    final_doc_status = (
+        "POSTED"
+        if expense_categorised.combined_confidence >= journal_writer.AUTO_POST_THRESHOLD
+        else "EXTRACTED"
+    )
+    await conn.execute(
+        "UPDATE documents SET status = $2, updated_at = NOW() WHERE id = $1",
+        document_id,
+        final_doc_status,
+    )
+
+    log.info(
+        "Document %s (%s) → journal entry %s (%s)",
+        document_id, doc_type, entry_id, final_doc_status,
+    )
+    return entry_id

@@ -229,27 +229,37 @@ async def get_statements(
 # Financial year helpers
 # ---------------------------------------------------------------------------
 
-def current_financial_year(fy_end_month: int) -> tuple[date, date]:
+import calendar as _calendar
+
+
+def financial_year(fy_end_month: int, fy_year: int) -> tuple[date, date]:
     """
-    Return (from_date, to_date) for the current financial year to date.
+    Return (from_date, to_date) for a specific financial year.
 
-    If today is past the FY end month, the FY started the month after
-    the last FY end. Otherwise it started the month after the FY end of
-    the previous year.
+    fy_year is the calendar year in which the FY ends.
 
-    Example: fy_end_month=2 (Feb), today=Apr 2026
-      → FY started 1 Mar 2026, to_date = today
+    Example: fy_end_month=2 (Feb), fy_year=2025
+      → from_date = 1 Mar 2024, to_date = 28 Feb 2025
     """
-    today = date.today()
-    fy_start_month = (fy_end_month % 12) + 1  # month after FY end
-
-    if today.month > fy_end_month:
-        fy_start_year = today.year
-    else:
-        fy_start_year = today.year - 1
-
+    fy_start_month = (fy_end_month % 12) + 1
+    # If start month > end month (e.g. Mar > Feb), the FY spans two calendar years
+    fy_start_year = fy_year - 1 if fy_start_month > fy_end_month else fy_year
+    last_day = _calendar.monthrange(fy_year, fy_end_month)[1]
     from_date = date(fy_start_year, fy_start_month, 1)
-    return from_date, today
+    to_date   = date(fy_year, fy_end_month, last_day)
+    # Cap to_date at today for the current (in-progress) FY
+    return from_date, min(to_date, date.today())
+
+
+def current_financial_year(fy_end_month: int) -> tuple[date, date]:
+    """Return (from_date, to_date) for the current financial year to date."""
+    today = date.today()
+    fy_start_month = (fy_end_month % 12) + 1
+    if today.month > fy_end_month:
+        current_fy_year = today.year + (1 if fy_start_month <= fy_end_month else 0)
+    else:
+        current_fy_year = today.year
+    return financial_year(fy_end_month, current_fy_year)
 
 
 # ---------------------------------------------------------------------------

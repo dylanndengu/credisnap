@@ -9,11 +9,11 @@ from dataclasses import dataclass
 from datetime import date
 from uuid import UUID
 
-import asyncpg
 import boto3
 
+from app.db.connection import get_pool
 from app.services.reporting import pdf_builder, report_queries
-from app.services.reporting.statement_generator import current_financial_year
+from app.services.reporting.statement_generator import financial_year
 
 log = logging.getLogger(__name__)
 
@@ -27,18 +27,20 @@ class ReportResult:
 
 
 async def generate_and_deliver(
-    conn: asyncpg.Connection,
     user_id: UUID,
     fy_end_month: int,
+    fy_year: int,
 ) -> ReportResult | None:
     """
     Full pipeline: fetch data → build PDF → upload to S3 → return pre-signed URL.
 
     Returns None if there is no data to report.
     """
-    from_date, to_date = current_financial_year(fy_end_month)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        from_date, to_date = financial_year(fy_end_month, fy_year)
 
-    data = await report_queries.fetch_report_data(conn, user_id, from_date, to_date)
+        data = await report_queries.fetch_report_data(conn, user_id, from_date, to_date)
 
     if not report_queries.has_any_data(data):
         return None

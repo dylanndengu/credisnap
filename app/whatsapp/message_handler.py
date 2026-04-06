@@ -33,6 +33,11 @@ State machine:
 │    → find most recent DRAFT journal entry, mark FAILED              │
 │    → send "Discarded" message                                       │
 ├─────────────────────────────────────────────────────────────────────┤
+│  conversation_state=AWAITING_DOCUMENT_TYPE                          │
+│    body="EXPENSE" / "PURCHASE" → resume as PURCHASE                 │
+│    body="INCOME"  / "SALE"     → resume as SALE                     │
+│    → call resume_document_with_type(), send result summary          │
+├─────────────────────────────────────────────────────────────────────┤
 │  Anything else                                                       │
 │    → send help message                                              │
 └─────────────────────────────────────────────────────────────────────┘
@@ -56,7 +61,7 @@ from app.whatsapp import media_handler
 from app.services.ocr import textract_parser
 from app.services.categorisation import llm_categoriser
 from app.services.ledger import journal_writer
-from app.services.reporting import statement_generator, report_orchestrator
+from app.services.reporting import statement_generator, report_orchestrator, report_queries
 from app.services.vision import receipt_checker
 
 import anthropic
@@ -134,7 +139,15 @@ _MSG_HELP = (
     "📎 *Send a photo or PDF* — record a receipt or invoice\n"
     "✅ *YES* — confirm a pending entry\n"
     "❌ *NO* — discard a pending entry\n"
-    "📊 *REPORT* — request your latest financial statements"
+    "📊 *REPORT* — request your latest financial statements\n"
+    "📊 *REPORT 2025* — request statements for a specific year"
+)
+
+_MSG_ASK_DOCUMENT_TYPE = (
+    "I'm not sure whether this is an *expense* or an *income* document.\n\n"
+    "Please reply:\n"
+    "  *EXPENSE* — a receipt or invoice you paid (purchase)\n"
+    "  *INCOME* — an invoice you issued to a customer (sale)"
 )
 
 
@@ -305,13 +318,50 @@ async def _recategorise_draft(
 
 
 async def _set_conversation_state(
-    conn: asyncpg.Connection, user_id: UUID, state: str | None
+    user_id: UUID, state: str | None
 ) -> None:
-    await conn.execute(
-        "UPDATE users SET conversation_state = $2::conversation_state, updated_at = NOW() WHERE id = $1",
-        user_id,
-        state,
-    )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET conversation_state = $2::conversation_state, updated_at = NOW() WHERE id = $1",
+            user_id,
+            state,
+        )
+
+
+async def _deliver_report(
+    from_number: str,
+    user_id: UUID,
+    fy_end_month: int,
+    fy_year: int,
+) -> None:
+    """Generate and deliver a PDF report for a specific financial year."""
+    try:
+        twilio_client.send_whatsapp(
+            from_number,
+            f"📊 Generating your {fy_year} financial report... this may take a moment."
+        )
+        result = await report_orchestrator.generate_and_deliver(user_id, fy_end_month, fy_year)
+        if result is None:
+            msg = (
+                f"No posted transactions found for the {fy_year} financial year.\n\n"
+                f"Upload receipts and confirm them to see your financial statements."
+            )
+        else:
+            msg = (
+                f"Your {fy_year} financial report is ready! 📊\n\n"
+                f"*{result.business_name}*\n"
+                f"Period: {result.from_date.strftime('%d %b %Y')} – "
+                f"{result.to_date.strftime('%d %b %Y')}\n\n"
+                f"Includes: Trial Balance, General Ledger, P&L, "
+                f"Balance Sheet, VAT201 Summary & Vendor Statements.\n\n"
+                f"Download your PDF (link expires in 24 hours):\n"
+                f"{result.presigned_url}"
+            )
+    except Exception:
+        log.exception("Failed to generate PDF report for %s", from_number)
+        msg = "Sorry, I couldn't generate your report right now. Please try again."
+    twilio_client.send_whatsapp(from_number, msg)
 
 
 async def _find_draft_entry(
@@ -410,6 +460,22 @@ async def _handle_media_message(
     from app.pipeline import process_document
     entry_id = await process_document(document_id, raw_textract)
 
+    # Classification uncertain — ask user to clarify document type
+    if entry_id is None:
+        await conn.execute(
+            """
+            UPDATE users SET
+                conversation_state  = 'AWAITING_DOCUMENT_TYPE'::conversation_state,
+                pending_document_id = $2,
+                updated_at          = NOW()
+            WHERE id = $1
+            """,
+            user_id,
+            document_id,
+        )
+        twilio_client.send_whatsapp(from_number, _MSG_ASK_DOCUMENT_TYPE)
+        return
+
     # 6. Notify user with outcome
     entry_row = await conn.fetchrow(
         """
@@ -481,8 +547,11 @@ async def handle_message(form_data: dict) -> None:
         log.error("Received message with no From field: %s", form_data)
         return
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+    pool = None
+    conn = None
+    try:
+        pool = await get_pool()
+        conn = await pool.acquire()
         user = await _ensure_user(conn, from_number)
         user_id: UUID = user["id"]
 
@@ -545,7 +614,7 @@ async def handle_message(form_data: dict) -> None:
             draft_entry_id = await _find_draft_entry(conn, user_id)
             choice = body.strip()
             if choice == "1":
-                await _set_conversation_state(conn, user_id, "AWAITING_CATEGORY_HINT")
+                await _set_conversation_state(user_id, "AWAITING_CATEGORY_HINT")
                 twilio_client.send_whatsapp(from_number, _MSG_ASK_CATEGORY_HINT)
             elif choice == "2":
                 if draft_entry_id:
@@ -555,7 +624,7 @@ async def handle_message(form_data: dict) -> None:
                         draft_entry_id,
                     )
                     await _delete_draft_entry(conn, draft_entry_id)
-                await _set_conversation_state(conn, user_id, None)
+                await _set_conversation_state(user_id, None)
                 twilio_client.send_whatsapp(
                     from_number,
                     "🗑️ Discarded. Please re-upload the receipt with a clearer photo."
@@ -568,7 +637,7 @@ async def handle_message(form_data: dict) -> None:
                         draft_entry_id,
                     )
                     await _delete_draft_entry(conn, draft_entry_id)
-                await _set_conversation_state(conn, user_id, None)
+                await _set_conversation_state(user_id, None)
                 twilio_client.send_whatsapp(from_number, "🗑️ Discarded. Send another receipt when ready.")
             else:
                 twilio_client.send_whatsapp(from_number, _MSG_REJECTION_OPTIONS)
@@ -580,12 +649,12 @@ async def handle_message(form_data: dict) -> None:
                 return
             draft_entry_id = await _find_draft_entry(conn, user_id)
             if draft_entry_id is None:
-                await _set_conversation_state(conn, user_id, None)
+                await _set_conversation_state(user_id, None)
                 twilio_client.send_whatsapp(from_number, _MSG_NO_PENDING)
                 return
             try:
                 new_entry_id = await _recategorise_draft(conn, user_id, draft_entry_id, hint=body)
-                await _set_conversation_state(conn, user_id, None)
+                await _set_conversation_state(user_id, None)
                 # Fetch and display the new categorisation
                 entry_row = await conn.fetchrow(
                     "SELECT je.status, d.gross_amount, d.vendor_name "
@@ -619,10 +688,142 @@ async def handle_message(form_data: dict) -> None:
                     )
             except Exception:
                 log.exception("Re-categorisation failed for %s", from_number)
-                await _set_conversation_state(conn, user_id, None)
+                await _set_conversation_state(user_id, None)
                 twilio_client.send_whatsapp(
                     from_number,
                     "Sorry, I couldn't re-categorise that. The entry has been discarded — please re-upload the receipt."
+                )
+            return
+
+        if conversation_state == "AWAITING_DOCUMENT_TYPE":
+            from app.pipeline import resume_document_with_type
+            from app.models.extraction import DocumentType
+
+            normalised = body.strip().upper()
+            if normalised in ("EXPENSE", "PURCHASE", "BILL", "RECEIPT"):
+                doc_type = DocumentType.PURCHASE
+            elif normalised in ("INCOME", "SALE", "INVOICE", "REVENUE"):
+                doc_type = DocumentType.SALE
+            else:
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Please reply *EXPENSE* (for a purchase/receipt you paid) "
+                    "or *INCOME* (for a sales invoice you issued)."
+                )
+                return
+
+            pending_doc_id = await conn.fetchval(
+                "SELECT pending_document_id FROM users WHERE id = $1",
+                user_id,
+            )
+            if pending_doc_id is None:
+                await _set_conversation_state(user_id, None)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "No document is waiting for clarification. Send a receipt to get started."
+                )
+                return
+
+            # Clear state before resuming so a crash doesn't leave the user stuck
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state  = NULL,
+                    pending_document_id = NULL,
+                    updated_at          = NOW()
+                WHERE id = $1
+                """,
+                user_id,
+            )
+
+            try:
+                entry_id = await resume_document_with_type(pending_doc_id, doc_type)
+            except Exception:
+                log.exception(
+                    "Resume failed for document %s (user %s)", pending_doc_id, user_id
+                )
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Sorry, something went wrong processing your document. "
+                    "Please try uploading it again."
+                )
+                return
+
+            # Fetch the result and notify the user
+            pool_inner = await get_pool()
+            async with pool_inner.acquire() as _conn:
+                entry_row = await _conn.fetchrow(
+                    """
+                    SELECT je.status, d.gross_amount, d.vendor_name
+                    FROM   journal_entries je
+                    JOIN   documents       d  ON d.id = je.document_id
+                    WHERE  je.id = $1
+                    """,
+                    entry_id,
+                )
+                if doc_type == DocumentType.SALE:
+                    display_rows = await _conn.fetch(
+                        """
+                        SELECT a.name, jel.credit_amount AS amount
+                        FROM   journal_entry_lines jel
+                        JOIN   accounts            a ON a.id = jel.account_id
+                        WHERE  jel.journal_entry_id = $1
+                          AND  jel.credit_amount > 0
+                          AND  a.code NOT IN ('2100')
+                        ORDER  BY jel.credit_amount DESC
+                        """,
+                        entry_id,
+                    )
+                else:
+                    display_rows = await _conn.fetch(
+                        """
+                        SELECT a.name, jel.debit_amount AS amount
+                        FROM   journal_entry_lines jel
+                        JOIN   accounts            a ON a.id = jel.account_id
+                        WHERE  jel.journal_entry_id = $1
+                          AND  jel.debit_amount > 0
+                          AND  a.code NOT IN ('1020')
+                        ORDER  BY jel.debit_amount DESC
+                        """,
+                        entry_id,
+                    )
+
+            type_label = "income" if doc_type == DocumentType.SALE else "expense"
+            category_lines = "\n".join(
+                f"  • {r['name']} — R{r['amount']:,.2f}" for r in display_rows
+            )
+            if entry_row["status"] == "POSTED":
+                msg = (
+                    f"✅ Recorded as {type_label}!\n\n"
+                    f"*{entry_row['vendor_name'] or 'Document'}* — "
+                    f"R{entry_row['gross_amount']:,.2f}\n\n"
+                    f"{category_lines}\n\n"
+                    f"Posted to your books automatically."
+                )
+            else:
+                msg = (
+                    f"📋 *{entry_row['vendor_name'] or 'Document'}* — "
+                    f"R{entry_row['gross_amount']:,.2f}\n\n"
+                    f"Categorised as {type_label}:\n{category_lines}\n\n"
+                    f"Reply *YES* to confirm and post, or *NO* to discard."
+                )
+            twilio_client.send_whatsapp(from_number, msg)
+            return
+
+        if conversation_state == "AWAITING_REPORT_YEAR":
+            fy_end_month = user.get("financial_year_end_month") or 2
+            if body.strip().isdigit():
+                fy_year = int(body.strip())
+                await _set_conversation_state(user_id, None)
+                await _deliver_report(from_number, user_id, fy_end_month, fy_year)
+            else:
+                available_years = await report_queries.fetch_available_fy_years(
+                    user_id, fy_end_month
+                )
+                year_list = "\n".join(f"  *{y}*" for y in available_years)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    f"Please reply with a valid year:\n\n{year_list}"
                 )
             return
 
@@ -649,42 +850,101 @@ async def handle_message(form_data: dict) -> None:
                     )
             else:
                 # Ask what was wrong instead of silently discarding
-                await _set_conversation_state(conn, user_id, "AWAITING_REJECTION_REASON")
+                await _set_conversation_state(user_id, "AWAITING_REJECTION_REASON")
                 twilio_client.send_whatsapp(from_number, _MSG_REJECTION_OPTIONS)
             return
 
         # REPORT keyword — generate PDF financial report
-        if body.strip().upper() == "REPORT":
-            try:
-                fy_end_month = user.get("financial_year_end_month") or 2
+        report_parts = body.strip().upper().split()
+        if report_parts and report_parts[0] == "REPORT":
+            fy_end_month = user.get("financial_year_end_month") or 2
+
+            # REPORT <year> — year provided directly, generate immediately
+            if len(report_parts) == 2 and report_parts[1].isdigit():
+                fy_year = int(report_parts[1])
+                await _deliver_report(from_number, user_id, fy_end_month, fy_year)
+                return
+
+            # REPORT — ask which year
+            available_years = await report_queries.fetch_available_fy_years(
+                user_id, fy_end_month
+            )
+            if not available_years:
                 twilio_client.send_whatsapp(
                     from_number,
-                    "📊 Generating your financial report... this may take a moment."
+                    "No posted transactions found yet.\n\n"
+                    "Upload a receipt and confirm it to see your financial statements."
                 )
-                result = await report_orchestrator.generate_and_deliver(
-                    conn, user_id, fy_end_month
-                )
-                if result is None:
-                    msg = (
-                        "No posted transactions found for this period yet.\n\n"
-                        "Upload a receipt and confirm it to see your financial statements."
-                    )
-                else:
-                    msg = (
-                        f"Your financial report is ready! 📊\n\n"
-                        f"*{result.business_name}*\n"
-                        f"Period: {result.from_date.strftime('%d %b %Y')} – "
-                        f"{result.to_date.strftime('%d %b %Y')}\n\n"
-                        f"Includes: Trial Balance, General Ledger, P&L, "
-                        f"Balance Sheet, VAT201 Summary & Vendor Statements.\n\n"
-                        f"Download your PDF (link expires in 24 hours):\n"
-                        f"{result.presigned_url}"
-                    )
-            except Exception:
-                log.exception("Failed to generate PDF report for %s", from_number)
-                msg = "Sorry, I couldn't generate your report right now. Please try again."
-            twilio_client.send_whatsapp(from_number, msg)
+                return
+
+            year_list = "\n".join(f"  *{y}*" for y in available_years)
+            await _set_conversation_state(user_id, "AWAITING_REPORT_YEAR")
+            twilio_client.send_whatsapp(
+                from_number,
+                f"📊 Which financial year would you like a report for?\n\n"
+                f"{year_list}\n\n"
+                f"Reply with the year (e.g. *{available_years[0]}*)."
+            )
+            return
+
+        # AWAITING_REPORT_YEAR is handled in the conversation_state block above,
+        # but guard here in case state was set and user sends a non-year text
+        if conversation_state == "AWAITING_REPORT_YEAR":
+            twilio_client.send_whatsapp(
+                from_number,
+                "Please reply with a year (e.g. *2025*), or type *REPORT* to see your options."
+            )
             return
 
         # Fall-through: unrecognised text
         twilio_client.send_whatsapp(from_number, _MSG_HELP)
+
+    except Exception as exc:
+        log.exception("Unhandled error processing message from %s", from_number)
+        try:
+            # Best-effort: clear any stuck conversation state so the user isn't trapped
+            try:
+                pool = await get_pool()
+                async with pool.acquire() as _conn:
+                    await _conn.execute(
+                        "UPDATE users SET conversation_state = NULL, updated_at = NOW() "
+                        "WHERE whatsapp_number = $1",
+                        from_number,
+                    )
+            except Exception:
+                log.exception("Could not reset conversation_state for %s", from_number)
+
+            exc_str = str(exc).lower()
+            if "does not balance" in exc_str:
+                fallback_msg = (
+                    "I couldn't record that receipt — the amounts didn't add up correctly. "
+                    "Please try sending it again, ideally as a clearer photo or PDF."
+                )
+            elif "could not extract a valid total" in exc_str or "no expensedocuments" in exc_str:
+                fallback_msg = (
+                    "I couldn't read the total on that document. "
+                    "Please make sure the full receipt is visible and try again."
+                )
+            elif "popia consent" in exc_str:
+                fallback_msg = (
+                    "It looks like your account isn't fully set up yet. "
+                    "Please reply *YES* to give consent and get started."
+                )
+            elif "s3" in exc_str or "upload" in exc_str:
+                fallback_msg = (
+                    "I had trouble saving your document. Please try sending it again."
+                )
+            elif "textract" in exc_str or "analyze_expense" in exc_str:
+                fallback_msg = (
+                    "I had trouble reading that document. "
+                    "Please send a clearer photo or a PDF and try again."
+                )
+            else:
+                fallback_msg = "Sorry, something went wrong on our end. Please try again in a moment."
+
+            twilio_client.send_whatsapp(from_number, fallback_msg)
+        except Exception:
+            log.exception("Failed to send fallback error message to %s", from_number)
+    finally:
+        if conn is not None and pool is not None:
+            await pool.release(conn)

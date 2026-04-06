@@ -23,6 +23,11 @@ _CENT = Decimal("0.01")
 _VAT_RATE = Decimal("0.15")
 
 
+class DocumentType(str, Enum):
+    PURCHASE = "PURCHASE"   # Receipt / supplier invoice — we are the buyer
+    SALE     = "SALE"       # Sales invoice — we are the seller
+
+
 class VatCode(str, Enum):
     SR = "SR"   # Standard Rate 15%  — generates a vat_entries row
     ZR = "ZR"   # Zero Rated 0%      — generates a vat_entries row (vat_amount = 0)
@@ -115,6 +120,7 @@ class CategorisedExpense(BaseModel):
     # Set by categoriser
     line_items: list[CategorisedLineItem]
     llm_confidence: float           # overall_confidence returned by the LLM tool call
+    document_type: DocumentType = DocumentType.PURCHASE
 
     @property
     def combined_confidence(self) -> float:

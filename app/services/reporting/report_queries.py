@@ -367,9 +367,10 @@ async def _fetch_vendor_statements(
             d.document_ref  AS invoice_number
         FROM journal_entries je
         JOIN documents d ON d.id = je.document_id
-        WHERE je.user_id    = $1
-          AND je.status     = 'POSTED'
-          AND je.entry_date BETWEEN $2 AND $3
+        WHERE je.user_id       = $1
+          AND je.status        = 'POSTED'
+          AND je.entry_date    BETWEEN $2 AND $3
+          AND COALESCE(d.document_type::text, 'PURCHASE') = 'PURCHASE'
         ORDER BY vendor_name, je.entry_date
         """,
         user_id, from_date, to_date,
@@ -425,3 +426,34 @@ async def fetch_report_data(
 
 def has_any_data(data: FullReportData) -> bool:
     return bool(data.trial_balance or data.general_ledger or data.vat201_periods)
+
+
+async def fetch_available_fy_years(
+    user_id: UUID,
+    fy_end_month: int,
+) -> list[int]:
+    """
+    Return a descending list of financial years (as ints) for which the user
+    has at least one POSTED journal entry.
+
+    fy_year is the calendar year in which the FY ends (e.g. 2025 = Mar 2024–Feb 2025).
+    """
+    from app.db.connection import get_pool
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT
+                CASE
+                    WHEN EXTRACT(MONTH FROM entry_date) <= $2
+                    THEN EXTRACT(YEAR FROM entry_date)::int
+                    ELSE (EXTRACT(YEAR FROM entry_date) + 1)::int
+                END AS fy_year
+            FROM journal_entries
+            WHERE user_id = $1 AND status = 'POSTED'
+            ORDER BY fy_year DESC
+            """,
+            user_id,
+            fy_end_month,
+        )
+    return [r["fy_year"] for r in rows]
