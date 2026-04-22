@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 async def process_document(
     document_id: UUID,
     raw_textract_json: dict,
+    auto_post: bool = True,
 ) -> UUID | None:
     """
     Run the full pipeline for a single uploaded document.
@@ -136,7 +137,8 @@ async def process_document(
                 return None
 
             return await _categorise_and_write(
-                conn, user_id, document_id, expense_raw, doc_type, anthropic_client
+                conn, user_id, document_id, expense_raw, doc_type, anthropic_client,
+                auto_post=auto_post,
             )
 
         except Exception as exc:
@@ -159,6 +161,7 @@ async def process_document(
 async def resume_document_with_type(
     document_id: UUID,
     doc_type: DocumentType,
+    auto_post: bool = True,
 ) -> UUID:
     """
     Resume processing a document whose type was confirmed by the user.
@@ -212,7 +215,8 @@ async def resume_document_with_type(
             )
 
             return await _categorise_and_write(
-                conn, user_id, document_id, expense_raw, doc_type, anthropic.Anthropic()
+                conn, user_id, document_id, expense_raw, doc_type, anthropic.Anthropic(),
+                auto_post=auto_post,
             )
 
         except Exception as exc:
@@ -239,6 +243,7 @@ async def _categorise_and_write(
     expense_raw: TextractExpense,
     doc_type: DocumentType,
     anthropic_client: anthropic.Anthropic,
+    auto_post: bool = True,
 ) -> UUID:
     """
     Shared categorise → normalise → write path used by both process_document
@@ -278,6 +283,7 @@ async def _categorise_and_write(
             user_id=user_id,
             document_id=document_id,
             expense=expense_categorised,
+            auto_post=auto_post,
         )
     else:
         entry_id = await journal_writer.write(
@@ -285,11 +291,12 @@ async def _categorise_and_write(
             user_id=user_id,
             document_id=document_id,
             expense=expense_categorised,
+            auto_post=auto_post,
         )
 
     final_doc_status = (
         "POSTED"
-        if expense_categorised.combined_confidence >= journal_writer.AUTO_POST_THRESHOLD
+        if (auto_post and expense_categorised.combined_confidence >= journal_writer.AUTO_POST_THRESHOLD)
         else "EXTRACTED"
     )
     await conn.execute(

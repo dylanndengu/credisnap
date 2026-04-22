@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(taskkill /IM ngrok.exe /F)",
+      "Bash(cmd /c \"taskkill /IM ngrok.exe /F\")",
+      "Bash(python generate_sales_receipts.py)",
+      "Bash(python tests/bulk_ingest.py sample_receipts/ +31648843351 --dry-run)",
+      "Bash(python tests/bulk_ingest.py sample_receipts/ +31648843351 --delay 0.5)",
+      "Bash(python -c ' *)",
+      "Bash(python tests/bulk_ingest.py sample_sales_receipts/ +31648843351 --delay 0.5)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/whatsapp/message_handler.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+    ]
+  }
+}

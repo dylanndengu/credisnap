@@ -61,6 +61,7 @@ async def write(
     user_id: UUID,
     document_id: UUID,
     expense: CategorisedExpense,
+    auto_post: bool = True,
 ) -> UUID:
     """
     Write a balanced journal entry for a categorised expense document.
@@ -226,10 +227,10 @@ async def write(
             line_order,
         )
 
-        # 5. Auto-post if combined confidence meets threshold.
+        # 5. Auto-post if enabled and combined confidence meets threshold.
         #    The trg_journal_entry_balance trigger fires here and rejects
         #    the update if debits ≠ credits, rolling back the entire transaction.
-        if expense.combined_confidence >= AUTO_POST_THRESHOLD:
+        if auto_post and expense.combined_confidence >= AUTO_POST_THRESHOLD:
             await conn.execute(
                 "UPDATE journal_entries SET status = 'POSTED' WHERE id = $1",
                 entry_id,
@@ -237,8 +238,8 @@ async def write(
             log.info("Journal entry %s auto-posted (confidence=%.2f)", entry_id, expense.combined_confidence)
         else:
             log.info(
-                "Journal entry %s left as DRAFT (confidence=%.2f < %.2f threshold)",
-                entry_id, expense.combined_confidence, AUTO_POST_THRESHOLD,
+                "Journal entry %s left as DRAFT (confidence=%.2f, auto_post=%s)",
+                entry_id, expense.combined_confidence, auto_post,
             )
 
     return entry_id
@@ -249,6 +250,7 @@ async def write_sale(
     user_id: UUID,
     document_id: UUID,
     expense: CategorisedExpense,
+    auto_post: bool = True,
 ) -> UUID:
     """
     Write a balanced journal entry for a sales invoice (income document).
@@ -399,8 +401,8 @@ async def write_sale(
                     _tax_period(expense.document_date),
                 )
 
-        # 4. Auto-post if confidence meets threshold
-        if expense.combined_confidence >= AUTO_POST_THRESHOLD:
+        # 4. Auto-post if enabled and confidence meets threshold
+        if auto_post and expense.combined_confidence >= AUTO_POST_THRESHOLD:
             await conn.execute(
                 "UPDATE journal_entries SET status = 'POSTED' WHERE id = $1",
                 entry_id,
@@ -408,8 +410,8 @@ async def write_sale(
             log.info("Sale entry %s auto-posted (confidence=%.2f)", entry_id, expense.combined_confidence)
         else:
             log.info(
-                "Sale entry %s left as DRAFT (confidence=%.2f < %.2f threshold)",
-                entry_id, expense.combined_confidence, AUTO_POST_THRESHOLD,
+                "Sale entry %s left as DRAFT (confidence=%.2f, auto_post=%s)",
+                entry_id, expense.combined_confidence, auto_post,
             )
 
     return entry_id

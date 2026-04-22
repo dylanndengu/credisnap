@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
 # ---------------------------------------------------------------------------
 # Bootstrap: load .env and set up Python path before any app imports
 # ---------------------------------------------------------------------------
