@@ -61,7 +61,8 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, timezone, datetime
+from collections import defaultdict
+from datetime import date, timezone, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4, UUID
 
@@ -79,6 +80,28 @@ from app.services.vision import receipt_checker
 import anthropic
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-number rate limiter (in-memory, resets on restart)
+# Prevents runaway Textract/LLM costs from a single misbehaving number.
+# ---------------------------------------------------------------------------
+
+_rate_buckets: dict[str, list[datetime]] = defaultdict(list)
+_RATE_WINDOW  = timedelta(minutes=1)
+_RATE_MAX     = 10  # messages per number per minute
+
+
+def _is_rate_limited(number: str) -> bool:
+    now    = datetime.utcnow()
+    cutoff = now - _RATE_WINDOW
+    bucket = _rate_buckets[number]
+    # Drop timestamps outside the window
+    _rate_buckets[number] = [t for t in bucket if t > cutoff]
+    if len(_rate_buckets[number]) >= _RATE_MAX:
+        return True
+    _rate_buckets[number].append(now)
+    return False
+
 
 # ---------------------------------------------------------------------------
 # WhatsApp message templates
@@ -102,16 +125,59 @@ _MSG_CONSENT_GRANTED = (
     "What is your business name?"
 )
 
+_MSG_ASK_PROVINCE = (
+    "Which province do you operate in?\n\n"
+    "*1* Gauteng\n"
+    "*2* Western Cape\n"
+    "*3* KwaZulu-Natal\n"
+    "*4* Eastern Cape\n"
+    "*5* Limpopo\n"
+    "*6* Mpumalanga\n"
+    "*7* North West\n"
+    "*8* Free State\n"
+    "*9* Northern Cape"
+)
+
+_PROVINCE_MAP = {
+    "1": "Gauteng", "2": "Western Cape", "3": "KwaZulu-Natal",
+    "4": "Eastern Cape", "5": "Limpopo", "6": "Mpumalanga",
+    "7": "North West", "8": "Free State", "9": "Northern Cape",
+}
+
+_MSG_ASK_BUSINESS_TYPE = (
+    "What type of business do you run?\n\n"
+    "*1* Retail / Trading\n"
+    "*2* Food & Catering\n"
+    "*3* Professional Services (consulting, legal, accounting)\n"
+    "*4* Construction & Trades\n"
+    "*5* Transport & Logistics\n"
+    "*6* Cleaning & Security\n"
+    "*7* Health & Wellness\n"
+    "*8* Agriculture\n"
+    "*9* Manufacturing\n"
+    "*10* Other"
+)
+
+_BUSINESS_TYPE_MAP = {
+    "1": "Retail / Trading", "2": "Food & Catering",
+    "3": "Professional Services", "4": "Construction & Trades",
+    "5": "Transport & Logistics", "6": "Cleaning & Security",
+    "7": "Health & Wellness", "8": "Agriculture",
+    "9": "Manufacturing", "10": "Other",
+}
+
 _MSG_ASK_TAX_REF = (
-    "Got it! One more question — what is your SARS income tax reference number?\n\n"
-    "This helps lenders verify your tax standing. Reply *SKIP* if you don't have one."
+    "Last one — what is your SARS income tax reference number?\n\n"
+    "This helps lenders verify your tax standing. Reply *SKIP* if you don't have one yet."
 )
 
 _MSG_ONBOARDING_DONE = (
     "You're all set! 🎉\n\n"
-    "Send me a photo or PDF of any receipt or invoice and I'll "
-    "automatically record it in your books.\n\n"
-    "When you're ready to view your financial statements, type *REPORT*."
+    "Here's how to record your income and expenses:\n\n"
+    "📎 *Send a photo or PDF* — I'll read any receipt or invoice\n"
+    "💵 *CASH SALE* — record a sale when you have no receipt\n\n"
+    "Type *REPORT* when you want your financial statements.\n"
+    "Type *HELP* anytime to see all commands."
 )
 
 _MSG_CONSENT_DECLINED = (
@@ -127,16 +193,6 @@ _MSG_PROCESSING = (
 _MSG_UNSUPPORTED_MEDIA = (
     "Sorry, I can only read JPEG, PNG, or PDF files. "
     "Please send a clear photo or PDF of your receipt."
-)
-
-_MSG_EDIT_MENU = (
-    "Editing your last entry:\n\n"
-    "{summary}\n\n"
-    "What's wrong?\n\n"
-    "*1* — Amount is wrong\n"
-    "*2* — Category is wrong\n"
-    "*3* — This isn't a business expense (reverse it)\n"
-    "*4* — Something else"
 )
 
 _MSG_ASK_CORRECT_AMOUNT = "What's the correct amount? (ZAR)\n\nE.g. *R 8 900* or *8900.00*"
@@ -155,7 +211,8 @@ _MSG_HELP = (
     "Here's what you can do:\n\n"
     "*Receipts & invoices*\n"
     "📎 Send a photo or PDF — I'll record it\n"
-    "✅ *YES* / ❌ *NO* — confirm or discard\n"
+    "💵 *CASH SALE* — record a sale with no receipt\n"
+    "✅ *YES* / ❌ *NO* — confirm or correct an entry\n"
     "✏️ *EDIT* — fix your last entry\n\n"
     "*Your books*\n"
     "📊 *BALANCE* — income vs expenses this month\n"
@@ -172,6 +229,32 @@ _MSG_ASK_DOCUMENT_TYPE = (
     "Please reply:\n"
     "  *EXPENSE* — a receipt or invoice you paid (purchase)\n"
     "  *INCOME* — an invoice you issued to a customer (sale)"
+)
+
+_MSG_EDIT_MENU = (
+    "What's wrong with this entry?\n\n"
+    "{summary}\n\n"
+    "*1* — Wrong type (recorded as expense but it's actually income, or vice versa)\n"
+    "*2* — The amount is wrong\n"
+    "*3* — The company or person name is wrong\n"
+    "*4* — Wrong category (e.g. should be fuel, not stationery)\n"
+    "*5* — Remove it completely"
+)
+
+_MSG_ASK_CORRECT_COUNTERPARTY = (
+    "What is the correct company or person name for this entry?\n\n"
+    "Just type the name as it should appear."
+)
+
+_MSG_ASK_CASH_SALE_DESCRIPTION = (
+    "What did you sell?\n\n"
+    "Describe it in a few words:\n"
+    "(e.g. 'catering for 20 people', '3 plastic chairs', 'repaired a gate motor', 'consulting session')"
+)
+
+_MSG_ASK_CASH_SALE_AMOUNT = (
+    "Got it. What was the total amount received? (ZAR)\n\n"
+    "E.g. *R 1 500* or *1500*"
 )
 
 
@@ -713,67 +796,96 @@ async def _post_draft_entry(conn: asyncpg.Connection, entry_id: UUID) -> str:
     return f"{row['description']} ({row['entry_date']})"
 
 
-def _posted_notification(vendor: str, amount, category: str) -> str:
-    return (
-        f"✅ Recorded.\n\n"
-        f"*{vendor}* — R {amount:,.2f}\n"
-        f"Category: {category}\n\n"
-        f"If anything looks wrong, reply *EDIT* within 24 hours."
-    )
-
-
-def _draft_notification(vendor: str, amount, category: str) -> str:
-    return (
-        f"📋 *{vendor}* — R {amount:,.2f}\n"
-        f"Category: {category}\n\n"
-        f"Reply *YES* to confirm and post, or *NO* if something's wrong."
-    )
-
-
 async def _build_result_message(
     conn: asyncpg.Connection,
     entry_id: UUID,
 ) -> str:
-    """Build the post-pipeline notification (POSTED or DRAFT)."""
+    """
+    Build the post-pipeline notification showing a full line-by-line breakdown.
+    Always ends with 'Is this correct? YES / NO' — entry is left as DRAFT until
+    the user confirms.
+    """
     row = await conn.fetchrow(
         """
-        SELECT je.status, d.vendor_name, d.gross_amount,
-               d.document_type::text AS document_type
+        SELECT d.vendor_name, d.gross_amount,
+               d.document_type::text AS document_type, d.document_date
         FROM   journal_entries je
         JOIN   documents       d ON d.id = je.document_id
         WHERE  je.id = $1
         """,
         entry_id,
     )
+
     is_sale = (row["document_type"] or "PURCHASE") == "SALE"
-    vendor  = row["vendor_name"] or "Unknown vendor"
-    amount  = row["gross_amount"] or Decimal(0)
+    vendor   = row["vendor_name"] or "Unknown vendor"
+    gross    = Decimal(str(row["gross_amount"] or 0))
+    date_str = _fmt_date(row["document_date"])
+
+    lines = await conn.fetch(
+        """
+        SELECT jel.debit_amount, jel.credit_amount,
+               a.name, a.account_type::text AS account_type, a.code
+        FROM   journal_entry_lines jel
+        JOIN   accounts a ON a.id = jel.account_id
+        WHERE  jel.journal_entry_id = $1
+        ORDER  BY jel.line_order
+        """,
+        entry_id,
+    )
+
+    is_credit_sale = any(line["code"] == "1110" for line in lines)
+
+    breakdown = []
+    for line in lines:
+        code         = line["code"]
+        name         = line["name"]
+        account_type = line["account_type"]
+
+        if code in ("1020", "1110"):
+            continue
+
+        if account_type == "EXPENSE":
+            amt = Decimal(str(line["debit_amount"]))
+            if amt > 0:
+                breakdown.append(f"  {name} — R {amt:,.2f}")
+        elif code == "1200":
+            amt = Decimal(str(line["debit_amount"]))
+            if amt > 0:
+                breakdown.append(f"  VAT (15%) — R {amt:,.2f}")
+        elif account_type == "REVENUE":
+            amt = Decimal(str(line["credit_amount"]))
+            if amt > 0:
+                breakdown.append(f"  {name} — R {amt:,.2f}")
+        elif code == "2100":
+            amt = Decimal(str(line["credit_amount"]))
+            if amt > 0:
+                breakdown.append(f"  VAT Output (15%) — R {amt:,.2f}")
+
+    breakdown_text = "\n".join(breakdown) if breakdown else "  (no line items)"
+    divider = "  " + "─" * 30
 
     if is_sale:
-        cat_row = await conn.fetchrow(
-            """
-            SELECT a.name FROM journal_entry_lines jel
-            JOIN accounts a ON a.id = jel.account_id
-            WHERE jel.journal_entry_id = $1 AND a.account_type = 'REVENUE'
-            ORDER BY jel.credit_amount DESC LIMIT 1
-            """,
-            entry_id,
-        )
+        icon = "💰"
+        if is_credit_sale:
+            header     = f"{icon} *{vendor}* — {date_str}\n  _(outstanding — not yet paid)_"
+            total_line = f"  Amount owed: R {gross:,.2f}"
+        else:
+            header     = f"{icon} *{vendor}* — {date_str}"
+            total_line = f"  Total received: R {gross:,.2f}"
     else:
-        cat_row = await conn.fetchrow(
-            """
-            SELECT a.name FROM journal_entry_lines jel
-            JOIN accounts a ON a.id = jel.account_id
-            WHERE jel.journal_entry_id = $1 AND a.account_type = 'EXPENSE'
-            ORDER BY jel.debit_amount DESC LIMIT 1
-            """,
-            entry_id,
-        )
-    category = cat_row["name"] if cat_row else "Uncategorised"
+        icon       = "🧾"
+        header     = f"{icon} *{vendor}* — {date_str}"
+        total_line = f"  Total: R {gross:,.2f}"
 
-    if row["status"] == "POSTED":
-        return _posted_notification(vendor, amount, category)
-    return _draft_notification(vendor, amount, category)
+    return (
+        f"📋 Here's what I recorded:\n\n"
+        f"{header}\n"
+        f"{breakdown_text}\n"
+        f"{divider}\n"
+        f"{total_line}\n\n"
+        f"Is this correct?\n"
+        f"Reply *YES* to save it or *NO* if something's wrong."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -829,21 +941,51 @@ async def _handle_media_message(
     raw_textract = media_handler.analyze_expense(bucket, key)
 
     from app.pipeline import process_document
-    entry_id = await process_document(document_id, raw_textract)
+    # Always leave as DRAFT from the WhatsApp flow — user confirms with YES/NO
+    entry_id = await process_document(document_id, raw_textract, auto_post=False)
 
     if entry_id is None:
-        # Classification uncertain — ask user
-        await conn.execute(
-            """
-            UPDATE users SET
-                conversation_state  = 'AWAITING_DOCUMENT_TYPE'::conversation_state,
-                pending_document_id = $2,
-                updated_at          = NOW()
-            WHERE id = $1
-            """,
-            user_id, document_id,
+        # Pipeline paused — check why by looking at what was stored on the document
+        doc_row = await conn.fetchrow(
+            "SELECT document_type, vendor_name, gross_amount FROM documents WHERE id = $1",
+            document_id,
         )
-        twilio_client.send_whatsapp(from_number, _MSG_ASK_DOCUMENT_TYPE)
+        stored_type = doc_row["document_type"] if doc_row else None
+
+        if stored_type == "SALE":
+            # We know it's a sale — ask whether payment has been received
+            vendor = doc_row["vendor_name"] or "Unknown"
+            amount = Decimal(str(doc_row["gross_amount"] or 0))
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state  = 'AWAITING_PAYMENT_CONFIRMED'::conversation_state,
+                    pending_document_id = $2,
+                    updated_at          = NOW()
+                WHERE id = $1
+                """,
+                user_id, document_id,
+            )
+            twilio_client.send_whatsapp(
+                from_number,
+                f"I can see a sales invoice from *{vendor}* for *R {amount:,.2f}*.\n\n"
+                f"Has this payment been received into your account?\n\n"
+                f"*YES* — money already received\n"
+                f"*NO* — still waiting for payment"
+            )
+        else:
+            # Document type is uncertain — ask expense or income
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state  = 'AWAITING_DOCUMENT_TYPE'::conversation_state,
+                    pending_document_id = $2,
+                    updated_at          = NOW()
+                WHERE id = $1
+                """,
+                user_id, document_id,
+            )
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_DOCUMENT_TYPE)
         return
 
     msg = await _build_result_message(conn, entry_id)
@@ -865,9 +1007,19 @@ async def handle_message(form_data: dict) -> None:
     from_number = _normalise_number(from_raw)
     body        = form_data.get("Body", "").strip()
     num_media   = int(form_data.get("NumMedia", 0))
+    latitude    = form_data.get("Latitude")
+    longitude   = form_data.get("Longitude")
 
     if not from_number:
         log.error("Received message with no From field: %s", form_data)
+        return
+
+    if _is_rate_limited(from_number):
+        log.warning("Rate limit hit for %s — dropping message", from_number)
+        twilio_client.send_whatsapp(
+            from_number,
+            "You're sending messages too quickly. Please wait a moment and try again."
+        )
         return
 
     pool = None
@@ -903,6 +1055,38 @@ async def handle_message(form_data: dict) -> None:
                 twilio_client.send_whatsapp(from_number, "Please enter your business name.")
                 return
             await _save_business_name(conn, user_id, body)
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_PROVINCE)
+            return
+
+        if onboarding_step == "PROVINCE":
+            choice = body.strip()
+            province = _PROVINCE_MAP.get(choice)
+            if province is None:
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Please reply with a number from 1 to 9.\n\n" + _MSG_ASK_PROVINCE
+                )
+                return
+            await conn.execute(
+                "UPDATE users SET province = $2, onboarding_step = 'BUSINESS_TYPE', updated_at = NOW() WHERE id = $1",
+                user_id, province,
+            )
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_BUSINESS_TYPE)
+            return
+
+        if onboarding_step == "BUSINESS_TYPE":
+            choice = body.strip()
+            business_type = _BUSINESS_TYPE_MAP.get(choice)
+            if business_type is None:
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Please reply with a number from 1 to 10.\n\n" + _MSG_ASK_BUSINESS_TYPE
+                )
+                return
+            await conn.execute(
+                "UPDATE users SET business_type = $2, onboarding_step = 'TAX_REF', updated_at = NOW() WHERE id = $1",
+                user_id, business_type,
+            )
             twilio_client.send_whatsapp(from_number, _MSG_ASK_TAX_REF)
             return
 
@@ -911,6 +1095,23 @@ async def handle_message(form_data: dict) -> None:
             await _save_tax_ref(conn, user_id, tax_ref)
             twilio_client.send_whatsapp(from_number, _MSG_ONBOARDING_DONE)
             return
+
+        # ------------------------------------------------------------------
+        # Opportunistic location capture
+        # If the user voluntarily shares their WhatsApp location at any point,
+        # store it — no response needed, just save quietly.
+        # ------------------------------------------------------------------
+        if latitude and longitude:
+            try:
+                await conn.execute(
+                    "UPDATE users SET latitude = $2, longitude = $3, updated_at = NOW() WHERE id = $1",
+                    user_id, float(latitude), float(longitude),
+                )
+                log.info("Location updated for user %s: %s, %s", user_id, latitude, longitude)
+            except Exception:
+                log.warning("Failed to save location for user %s", user_id)
+            if not body and num_media == 0:
+                return  # pure location share — nothing else to process
 
         # ------------------------------------------------------------------
         # Fully onboarded — media upload
@@ -973,7 +1174,7 @@ async def handle_message(form_data: dict) -> None:
             )
 
             try:
-                entry_id = await resume_document_with_type(pending_doc_id, doc_type)
+                entry_id = await resume_document_with_type(pending_doc_id, doc_type, auto_post=False)
             except Exception:
                 log.exception("Resume failed for document %s (user %s)", pending_doc_id, user_id)
                 twilio_client.send_whatsapp(
@@ -989,6 +1190,227 @@ async def handle_message(form_data: dict) -> None:
             twilio_client.send_whatsapp(from_number, msg)
             return
 
+        # ── AWAITING_CASH_SALE_DESCRIPTION ───────────────────────────────
+        if conversation_state == "AWAITING_CASH_SALE_DESCRIPTION":
+            if not body.strip():
+                twilio_client.send_whatsapp(from_number, _MSG_ASK_CASH_SALE_DESCRIPTION)
+                return
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state       = 'AWAITING_CASH_SALE_AMOUNT'::conversation_state,
+                    pending_sale_description = $2,
+                    updated_at               = NOW()
+                WHERE id = $1
+                """,
+                user_id, body.strip(),
+            )
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_CASH_SALE_AMOUNT)
+            return
+
+        # ── AWAITING_CASH_SALE_AMOUNT ─────────────────────────────────────
+        if conversation_state == "AWAITING_CASH_SALE_AMOUNT":
+            gross = _parse_zar_amount(body)
+            if gross is None:
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "I couldn't read that amount. Please reply with just the number:\n"
+                    "E.g. *1500* or *R 1 500.00*"
+                )
+                return
+
+            sale_description = await conn.fetchval(
+                "SELECT pending_sale_description FROM users WHERE id = $1", user_id
+            )
+            if not sale_description:
+                await conn.execute(
+                    "UPDATE users SET conversation_state = NULL, updated_at = NOW() WHERE id = $1",
+                    user_id,
+                )
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Something went wrong — I lost the description. Please type *CASH SALE* to start again."
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state       = NULL,
+                    pending_sale_description = NULL,
+                    updated_at               = NOW()
+                WHERE id = $1
+                """,
+                user_id,
+            )
+
+            try:
+                from app.services.categorisation.revenue_categoriser import categorise_text_sale
+                from app.services.ledger import journal_writer
+                from datetime import date as _date
+                import anthropic as _anthropic
+
+                valid_codes = {r["code"] for r in await conn.fetch(
+                    "SELECT code FROM accounts WHERE user_id = $1 AND is_active = TRUE", user_id
+                )}
+                account_code, vat_code, confidence = categorise_text_sale(
+                    description=sale_description,
+                    gross_total=gross,
+                    valid_account_codes=valid_codes,
+                    anthropic_client=_anthropic.Anthropic(),
+                )
+                entry_id = await journal_writer.write_cash_sale(
+                    conn=conn,
+                    user_id=user_id,
+                    description=sale_description,
+                    gross_total=gross,
+                    account_code=account_code,
+                    vat_code=vat_code,
+                    entry_date=_date.today(),
+                    confidence=confidence,
+                )
+
+                from decimal import Decimal as _D
+                from app.models.extraction import VatCode as _VatCode
+                vat_rate   = _D("0.15") if vat_code == _VatCode.SR else _D("0.00")
+                net_amount = (gross / (1 + vat_rate)).quantize(_D("0.01"))
+                vat_amount = (gross - net_amount).quantize(_D("0.01"))
+
+                # Look up the revenue account name for the breakdown
+                acct_name = await conn.fetchval(
+                    "SELECT name FROM accounts WHERE user_id = $1 AND code = $2",
+                    user_id, account_code,
+                ) or "Sales"
+
+                divider = "  " + "─" * 30
+                vat_line = f"  VAT Output (15%) — R {vat_amount:,.2f}\n" if vat_amount > 0 else ""
+                msg = (
+                    f"📋 Here's what I recorded:\n\n"
+                    f"💰 *Cash sale* — {_date.today().strftime('%d %b %Y')}\n"
+                    f"  {acct_name} — R {net_amount:,.2f}\n"
+                    f"{vat_line}"
+                    f"{divider}\n"
+                    f"  Total received: R {gross:,.2f}\n\n"
+                    f"Is this correct?\n"
+                    f"Reply *YES* to save it or *NO* if something's wrong."
+                )
+                twilio_client.send_whatsapp(from_number, msg)
+            except Exception:
+                log.exception("Cash sale write failed for user %s", user_id)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Sorry, something went wrong recording that sale. Please try again."
+                )
+            return
+
+        # ── AWAITING_PAYMENT_CONFIRMED ────────────────────────────────────
+        if conversation_state == "AWAITING_PAYMENT_CONFIRMED":
+            from app.pipeline import complete_sale_with_payment_status
+
+            normalised = body.strip().upper()
+            if normalised in ("YES", "Y", "JA"):
+                is_paid = True
+            elif normalised in ("NO", "N", "NEE"):
+                is_paid = False
+            else:
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Please reply *YES* (payment already received) or *NO* (still waiting for payment)."
+                )
+                return
+
+            pending_doc_id = await conn.fetchval(
+                "SELECT pending_document_id FROM users WHERE id = $1", user_id
+            )
+            if pending_doc_id is None:
+                await _set_conversation_state(user_id, None)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "No document is waiting. Send a receipt to get started."
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state  = NULL,
+                    pending_document_id = NULL,
+                    updated_at          = NOW()
+                WHERE id = $1
+                """,
+                user_id,
+            )
+
+            try:
+                entry_id = await complete_sale_with_payment_status(pending_doc_id, is_paid, auto_post=False)
+                pool_inner = await get_pool()
+                async with pool_inner.acquire() as _conn:
+                    msg = await _build_result_message(_conn, entry_id)
+                twilio_client.send_whatsapp(from_number, msg)
+            except Exception:
+                log.exception("Failed to complete sale for document %s", pending_doc_id)
+                twilio_client.send_whatsapp(
+                    from_number,
+                    "Sorry, something went wrong processing that document. Please try uploading it again."
+                )
+            return
+
+        # ── AWAITING_CORRECT_COUNTERPARTY ─────────────────────────────────
+        if conversation_state == "AWAITING_CORRECT_COUNTERPARTY":
+            if not body.strip():
+                twilio_client.send_whatsapp(from_number, _MSG_ASK_CORRECT_COUNTERPARTY)
+                return
+
+            pending_entry_id = await conn.fetchval(
+                "SELECT pending_entry_id FROM users WHERE id = $1", user_id
+            )
+            if pending_entry_id is None:
+                await _set_conversation_state(user_id, None)
+                twilio_client.send_whatsapp(from_number, _MSG_NO_PENDING)
+                return
+
+            correct_name = body.strip()
+            try:
+                # Update vendor_name on the document and description on the entry
+                await conn.execute(
+                    """
+                    UPDATE documents SET vendor_name = $2, updated_at = NOW()
+                    WHERE id = (SELECT document_id FROM journal_entries WHERE id = $1)
+                    """,
+                    pending_entry_id, correct_name,
+                )
+                await conn.execute(
+                    """
+                    UPDATE journal_entries
+                    SET description = REGEXP_REPLACE(description, '^(.*?:).*', '\\1 ' || $2),
+                        updated_at  = NOW()
+                    WHERE id = $1
+                    """,
+                    pending_entry_id, correct_name,
+                )
+                await conn.execute(
+                    """
+                    UPDATE users SET
+                        conversation_state = NULL,
+                        pending_entry_id   = NULL,
+                        updated_at         = NOW()
+                    WHERE id = $1
+                    """,
+                    user_id,
+                )
+                twilio_client.send_whatsapp(
+                    from_number,
+                    f"Done — updated to *{correct_name}*. ✅\n\nIf anything else looks wrong, reply *EDIT*."
+                )
+            except Exception:
+                log.exception("Counterparty correction failed for entry %s", pending_entry_id)
+                await conn.execute(
+                    "UPDATE users SET conversation_state = NULL, pending_entry_id = NULL, updated_at = NOW() WHERE id = $1",
+                    user_id,
+                )
+                twilio_client.send_whatsapp(from_number, "Sorry, I couldn't update the name. Please try again.")
+            return
+
         # ── AWAITING_EDIT_CHOICE ───────────────────────────────────────────
         if conversation_state == "AWAITING_EDIT_CHOICE":
             pending_entry_id = await conn.fetchval(
@@ -1002,20 +1424,54 @@ async def handle_message(form_data: dict) -> None:
             choice = body.strip()
 
             if choice == "1":
+                # Wrong type — reverse and re-ask EXPENSE vs INCOME
+                try:
+                    doc_id = await conn.fetchval(
+                        "SELECT document_id FROM journal_entries WHERE id = $1", pending_entry_id
+                    )
+                    await _reverse_entry(conn, user_id, pending_entry_id)
+                    await conn.execute(
+                        """
+                        UPDATE users SET
+                            conversation_state  = 'AWAITING_DOCUMENT_TYPE'::conversation_state,
+                            pending_entry_id    = NULL,
+                            pending_document_id = $2,
+                            updated_at          = NOW()
+                        WHERE id = $1
+                        """,
+                        user_id, doc_id,
+                    )
+                    twilio_client.send_whatsapp(from_number, _MSG_ASK_DOCUMENT_TYPE)
+                except Exception:
+                    log.exception("Type correction failed for entry %s", pending_entry_id)
+                    await conn.execute(
+                        "UPDATE users SET conversation_state = NULL, pending_entry_id = NULL, updated_at = NOW() WHERE id = $1",
+                        user_id,
+                    )
+                    twilio_client.send_whatsapp(from_number, "Sorry, I couldn't fix that. Please try again.")
+
+            elif choice == "2":
                 await conn.execute(
                     "UPDATE users SET conversation_state = 'AWAITING_CORRECT_AMOUNT'::conversation_state, updated_at = NOW() WHERE id = $1",
                     user_id,
                 )
                 twilio_client.send_whatsapp(from_number, _MSG_ASK_CORRECT_AMOUNT)
 
-            elif choice == "2":
+            elif choice == "3":
+                await conn.execute(
+                    "UPDATE users SET conversation_state = 'AWAITING_CORRECT_COUNTERPARTY'::conversation_state, updated_at = NOW() WHERE id = $1",
+                    user_id,
+                )
+                twilio_client.send_whatsapp(from_number, _MSG_ASK_CORRECT_COUNTERPARTY)
+
+            elif choice == "4":
                 await conn.execute(
                     "UPDATE users SET conversation_state = 'AWAITING_CATEGORY_HINT'::conversation_state, updated_at = NOW() WHERE id = $1",
                     user_id,
                 )
                 twilio_client.send_whatsapp(from_number, _MSG_ASK_CATEGORY_HINT)
 
-            elif choice == "3":
+            elif choice == "5":
                 try:
                     await _reverse_entry(conn, user_id, pending_entry_id)
                     await conn.execute(
@@ -1024,7 +1480,7 @@ async def handle_message(form_data: dict) -> None:
                     )
                     twilio_client.send_whatsapp(
                         from_number,
-                        "Done. I've reversed that entry — it's been removed from your books."
+                        "Done — that entry has been removed from your books. ✅"
                     )
                 except Exception:
                     log.exception("Reversal failed for entry %s", pending_entry_id)
@@ -1032,25 +1488,12 @@ async def handle_message(form_data: dict) -> None:
                         "UPDATE users SET conversation_state = NULL, pending_entry_id = NULL, updated_at = NOW() WHERE id = $1",
                         user_id,
                     )
-                    twilio_client.send_whatsapp(
-                        from_number, "Sorry, I couldn't reverse that entry. Please try again."
-                    )
-
-            elif choice == "4":
-                await conn.execute(
-                    "UPDATE users SET conversation_state = 'AWAITING_CATEGORY_HINT'::conversation_state, updated_at = NOW() WHERE id = $1",
-                    user_id,
-                )
-                twilio_client.send_whatsapp(
-                    from_number,
-                    "Please describe the issue in a few words and I'll do my best to fix it:\n"
-                    "(e.g. 'this was a personal expense', 'wrong supplier name', 'split between fuel and parking')"
-                )
+                    twilio_client.send_whatsapp(from_number, "Sorry, I couldn't remove that entry. Please try again.")
 
             else:
                 twilio_client.send_whatsapp(
                     from_number,
-                    "Please reply with *1*, *2*, *3*, or *4*."
+                    "Please reply with *1*, *2*, *3*, *4*, or *5*."
                 )
             return
 
@@ -1172,12 +1615,14 @@ async def handle_message(form_data: dict) -> None:
             if confirmation == "YES":
                 try:
                     await _post_draft_entry(conn, draft_entry_id)
-                    msg = await _build_result_message(conn, draft_entry_id)
-                    twilio_client.send_whatsapp(from_number, msg)
+                    twilio_client.send_whatsapp(
+                        from_number,
+                        "✅ Saved to your books.\n\nReply *EDIT* within 24 hours if you need to change anything."
+                    )
                 except Exception:
                     log.exception("Failed to post entry %s", draft_entry_id)
                     twilio_client.send_whatsapp(
-                        from_number, "Sorry, I couldn't post that entry. Please try again."
+                        from_number, "Sorry, I couldn't save that entry. Please try again."
                     )
             else:
                 # NO → enter edit flow
@@ -1197,8 +1642,22 @@ async def handle_message(form_data: dict) -> None:
             await _enter_edit_flow(conn, user_id, entry_id, from_number)
             return
 
-        # Your Books commands
+        # CASH SALE — manual income entry with no document
         cmd = body.strip().upper()
+        if cmd in ("CASH SALE", "CASHSALE", "SALE"):
+            await conn.execute(
+                """
+                UPDATE users SET
+                    conversation_state = 'AWAITING_CASH_SALE_DESCRIPTION'::conversation_state,
+                    updated_at         = NOW()
+                WHERE id = $1
+                """,
+                user_id,
+            )
+            twilio_client.send_whatsapp(from_number, _MSG_ASK_CASH_SALE_DESCRIPTION)
+            return
+
+        # Your Books commands
         if cmd == "BALANCE":
             twilio_client.send_whatsapp(from_number, await _cmd_balance(conn, user_id))
             return
@@ -1243,7 +1702,7 @@ async def handle_message(form_data: dict) -> None:
             )
             return
 
-        # Fall-through
+        # HELP command or fall-through for unrecognised text
         twilio_client.send_whatsapp(from_number, _MSG_HELP)
 
     except Exception as exc:
@@ -1347,7 +1806,7 @@ async def _grant_consent(conn: asyncpg.Connection, user_id: UUID) -> None:
 
 async def _save_business_name(conn: asyncpg.Connection, user_id: UUID, business_name: str) -> None:
     await conn.execute(
-        "UPDATE users SET business_name=$2, onboarding_step='TAX_REF', updated_at=NOW() WHERE id=$1",
+        "UPDATE users SET business_name=$2, onboarding_step='PROVINCE', updated_at=NOW() WHERE id=$1",
         user_id, business_name.strip(),
     )
 

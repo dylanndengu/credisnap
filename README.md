@@ -28,8 +28,9 @@ Users upload receipts and invoices via WhatsApp; CrediSnap extracts the data, ca
 | Command | Description |
 |---|---|
 | Send photo / PDF | Record a receipt or invoice |
-| `YES` | Confirm and post a pending (DRAFT) entry |
-| `NO` | Flag a problem with a pending entry → opens edit menu |
+| `CASH SALE` | Record a cash sale with no receipt (guided text flow) |
+| `YES` | Confirm and save a pending entry |
+| `NO` | Something's wrong → opens structured correction menu |
 | `EDIT` | Correct the most recently recorded entry |
 | `BALANCE` | Income vs expenses snapshot for the current month |
 | `LAST` | Details of the most recent journal entry |
@@ -133,9 +134,12 @@ The pipeline distinguishes between documents the business received (purchases) a
 
 - **Purchase path**: DR Expense (net) + DR VAT Input 1200 / CR Bank 1020. Creates `INPUT` vat_entries.
 
-- **Sale path** (`write_sale`): DR Bank 1020 (gross) / CR Revenue 4xxx (net) + CR VAT Output 2100. Creates `OUTPUT` vat_entries. Revenue accounts mapped via `revenue_categoriser` using 4xxx codes (4010 Products, 4020 Services, 4030 Consulting, 4040 Rental).
+- **Sale path** — two variants depending on payment status (see Step 12):
+  - `write_sale`: DR Bank 1020 (gross) / CR Revenue 4xxx (net) + CR VAT Output 2100 — cash received.
+  - `write_sale_on_credit`: DR Trade Debtors 1110 (gross) / CR Revenue 4xxx (net) + CR VAT Output 2100 — payment outstanding.
+  - Both create `OUTPUT` vat_entries. Revenue accounts mapped via `revenue_categoriser` using 4xxx codes.
 
-- Both paths share the same `AUTO_POST_THRESHOLD` (0.85) and DRAFT confirmation flow.
+- Both purchase and sale paths leave entries as DRAFT for WhatsApp confirmation — the user sees a full line-by-line breakdown before replying YES/NO.
 
 ### Step 8 — Structured Edit & Correction Flow ✅
 *Files: [`app/whatsapp/message_handler.py`](app/whatsapp/message_handler.py), [`db/migrations/010_edit_states.sql`](db/migrations/010_edit_states.sql)*
@@ -144,28 +148,34 @@ After a receipt is recorded, the user can correct it via a structured menu — n
 
 **User journey:**
 
-1. Receipt processed → auto-posted if confidence ≥ 0.85:
-   > ✅ *Recorded. Shell Garage — R 890.00. Category: Fuel and Vehicle Exp. Reply EDIT within 24 hours if anything looks wrong.*
+1. Every upload shows a full line-by-line breakdown and always asks for confirmation:
+   > 📋 *Here's what I recorded:*
+   > 🧾 *Shell Garage — 15 Apr 2025*
+   >   Fuel and Vehicle Exp — R 773.91
+   >   VAT (15%) — R 116.09
+   >   ──────────────────────────────
+   >   Total: R 890.00
+   >
+   > *Is this correct? Reply YES to save it or NO if something's wrong.*
 
-2. Low-confidence receipt → DRAFT, awaiting confirmation:
-   > 📋 *Shell Garage — R 890.00. Category: Fuel. Reply YES to confirm or NO if something's wrong.*
+2. User types `EDIT` or replies `NO` → structured correction menu with 5 options:
+   > **1** — Wrong type (recorded as expense but it's income, or vice versa)
+   > **2** — The amount is wrong
+   > **3** — The company or person name is wrong
+   > **4** — Wrong category (e.g. should be fuel, not stationery)
+   > **5** — Remove it completely
 
-3. User types `EDIT` (or `NO` on a DRAFT) → structured correction menu:
-   > **1** — Amount is wrong
-   > **2** — Category is wrong
-   > **3** — This isn't a business expense (reverse it)
-   > **4** — Something else
-
-4. Option routes to a scoped follow-up:
-   - **1** → "What's the correct amount?" → parses ZAR → reverses original + re-records at correct amount
-   - **2** → "What is this for?" → one LLM re-categorisation call → reverses + re-posts with correct category
-   - **3** → Creates reversing entry immediately, no LLM call
-   - **4** → "Describe the issue briefly" → one LLM re-categorisation call
+3. Each option routes to a scoped follow-up:
+   - **1** → reverses the entry, re-asks EXPENSE or INCOME (full pipeline reruns)
+   - **2** → "What's the correct amount?" → reverses + re-records at corrected total
+   - **3** → "What's the correct name?" → updates `vendor_name` in-place, no reversal needed
+   - **4** → "What is this for?" → one LLM re-categorisation call → reverses + re-posts
+   - **5** → creates reversing entry immediately, no LLM call
 
 **Reversing entries**: posted entries are immutable (DB trigger). All corrections work by posting an equal-and-opposite reversing journal entry, then creating a new correct entry. This preserves the full audit trail as required by SARS TAA s29.
 
-**New DB fields** ([`010_edit_states.sql`](db/migrations/010_edit_states.sql)):
-- `conversation_state` enum: added `AWAITING_EDIT_CHOICE`, `AWAITING_CORRECT_AMOUNT`
+**DB fields** ([`010_edit_states.sql`](db/migrations/010_edit_states.sql)):
+- `conversation_state` enum: added `AWAITING_EDIT_CHOICE`, `AWAITING_CORRECT_AMOUNT`, `AWAITING_CORRECT_COUNTERPARTY`
 - `users.pending_entry_id UUID` — tracks which journal entry is being corrected
 
 ### Step 9 — "Your Books" Quick Commands ✅
@@ -207,6 +217,45 @@ python generate_sales_receipts.py
 python tests/bulk_ingest.py sample_sales_receipts/ +27821234567 --delay 0.5
 ```
 
-### Step 12 — Deployment 🔲
+### Step 12 — Income Side & Confirmation UX ✅
+*Files: [`app/whatsapp/message_handler.py`](app/whatsapp/message_handler.py), [`app/services/ledger/journal_writer.py`](app/services/ledger/journal_writer.py), [`app/services/categorisation/revenue_categoriser.py`](app/services/categorisation/revenue_categoriser.py), [`app/pipeline.py`](app/pipeline.py), [`db/migrations/011_payment_state.sql`](db/migrations/011_payment_state.sql), [`db/migrations/012_expand_revenue_coa.sql`](db/migrations/012_expand_revenue_coa.sql), [`db/migrations/013_cash_sale_state.sql`](db/migrations/013_cash_sale_state.sql)*
+
+**Payment status question for sales:**
+When a document is classified as a SALE, the pipeline pauses before writing and asks whether payment has been received. This determines which journal path is used and ensures IFRS accrual accounting is correct:
+- *YES (paid)* → `write_sale`: DR Bank 1020 / CR Revenue + CR VAT Output
+- *NO (outstanding)* → `write_sale_on_credit`: DR Trade Debtors 1110 / CR Revenue + CR VAT Output
+
+**Expanded revenue Chart of Accounts** ([`012_expand_revenue_coa.sql`](db/migrations/012_expand_revenue_coa.sql)):
+Seven new revenue codes added to cover common SA SME income types:
+
+| Code | Name |
+|---|---|
+| `4050` | Consulting and Professional Fees |
+| `4060` | Commission and Agency Income |
+| `4070` | Rental Income |
+| `4080` | Catering and Food Sales |
+| `4090` | Contract and Project Income |
+| `4100` | Maintenance and Repair Services |
+| `4110` | Freight and Delivery Income |
+
+The `revenue_categoriser` system prompt was rewritten with descriptions for all 11 revenue codes. New codes are seeded into all existing users' accounts automatically.
+
+**Cash sale without a document (`CASH SALE` command):**
+For market stall vendors, caterers, and others who collect cash without issuing a formal document:
+1. User types `CASH SALE`
+2. Bot asks: *"What did you sell?"* — plain text description
+3. Bot asks: *"What was the total amount received?"*
+4. claude-haiku categorises the description into the correct 4xxx revenue code and back-calculates net + VAT (gross ÷ 1.15)
+5. Full breakdown shown, user confirms with YES/NO
+
+`write_cash_sale()` writes the entry with `document_id = NULL` — the schema already permitted this for manual adjustments. VAT entries are created as OUTPUT type.
+
+**DB additions** ([`011_payment_state.sql`](db/migrations/011_payment_state.sql), [`013_cash_sale_state.sql`](db/migrations/013_cash_sale_state.sql)):
+- `conversation_state` enum: `AWAITING_PAYMENT_CONFIRMED`, `AWAITING_CORRECT_COUNTERPARTY`, `AWAITING_CASH_SALE_DESCRIPTION`, `AWAITING_CASH_SALE_AMOUNT`
+- `users.pending_sale_description TEXT` — holds the cash sale description between conversation turns
+
+---
+
+### Step 13 — Deployment 🔲
 
 Dockerised application, environment configuration, AWS infrastructure (RDS PostgreSQL, S3 bucket, Textract IAM roles), and CI/CD pipeline.

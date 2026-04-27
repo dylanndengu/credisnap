@@ -9,7 +9,11 @@
       "Bash(python tests/bulk_ingest.py sample_receipts/ +31648843351 --delay 0.5)",
       "Bash(python -c ' *)",
       "Bash(python tests/bulk_ingest.py sample_sales_receipts/ +31648843351 --delay 0.5)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app/whatsapp/message_handler.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/whatsapp/message_handler.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -m pytest tests/test_message_handler.py -q)",
+      "Bash(psql postgresql://postgres:Babaharare26031995@db.wsruhchixmgzvlnydkox.supabase.co:5432/postgres)",
+      "Bash(python -)",
+      "Bash(python db_shell.py status)"
     ]
   }
 }

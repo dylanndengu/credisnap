@@ -136,6 +136,20 @@ async def process_document(
                 )
                 return None
 
+            if doc_type == DocumentType.SALE:
+                # Store the confirmed type but pause — caller must ask "has this been paid?"
+                await conn.execute(
+                    """
+                    UPDATE documents
+                    SET document_type = $2::document_type, status = 'EXTRACTED', updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    document_id,
+                    doc_type.value,
+                )
+                log.info("Document %s classified as SALE — pausing for payment status", document_id)
+                return None
+
             return await _categorise_and_write(
                 conn, user_id, document_id, expense_raw, doc_type, anthropic_client,
                 auto_post=auto_post,
@@ -236,6 +250,80 @@ async def resume_document_with_type(
             raise
 
 
+async def complete_sale_with_payment_status(
+    document_id: UUID,
+    is_paid: bool,
+    auto_post: bool = True,
+) -> UUID:
+    """
+    Complete processing of a SALE document after the user has confirmed payment status.
+
+    is_paid=True  → DR Bank 1020 / CR Revenue + CR VAT Output  (cash received)
+    is_paid=False → DR Trade Debtors 1110 / CR Revenue + CR VAT Output  (outstanding)
+
+    Reads the stored ocr_raw_json; does not re-call Textract.
+    Returns the UUID of the created journal entry.
+    """
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT d.id, d.user_id, d.ocr_raw_json, u.popia_consent_given
+            FROM   documents d
+            JOIN   users     u ON u.id = d.user_id
+            WHERE  d.id = $1
+            """,
+            document_id,
+        )
+
+        if row is None:
+            raise ValueError(f"Document {document_id} not found")
+        if not row["popia_consent_given"]:
+            raise ValueError(f"User {row['user_id']} has not given POPIA consent")
+        if not row["ocr_raw_json"]:
+            raise ValueError(f"Document {document_id} has no stored OCR data")
+
+        user_id  = row["user_id"]
+        raw_json = row["ocr_raw_json"]
+        if isinstance(raw_json, str):
+            import json as _json
+            raw_json = _json.loads(raw_json)
+
+        await conn.execute(
+            "UPDATE documents SET status = 'PROCESSING', updated_at = NOW() WHERE id = $1",
+            document_id,
+        )
+
+        try:
+            expense_raw = textract_parser.parse(raw_json)
+            return await _categorise_and_write(
+                conn=conn,
+                user_id=user_id,
+                document_id=document_id,
+                expense_raw=expense_raw,
+                doc_type=DocumentType.SALE,
+                anthropic_client=anthropic.Anthropic(),
+                auto_post=auto_post,
+                sale_is_paid=is_paid,
+            )
+        except Exception as exc:
+            await conn.execute(
+                """
+                UPDATE documents SET
+                    status        = 'FAILED',
+                    error_message = $2,
+                    retry_count   = retry_count + 1,
+                    updated_at    = NOW()
+                WHERE id = $1
+                """,
+                document_id,
+                str(exc),
+            )
+            log.exception("complete_sale_with_payment_status failed for document %s", document_id)
+            raise
+
+
 async def _categorise_and_write(
     conn: asyncpg.Connection,
     user_id: UUID,
@@ -244,10 +332,14 @@ async def _categorise_and_write(
     doc_type: DocumentType,
     anthropic_client: anthropic.Anthropic,
     auto_post: bool = True,
+    sale_is_paid: bool = True,
 ) -> UUID:
     """
     Shared categorise → normalise → write path used by both process_document
     and resume_document_with_type.
+
+    sale_is_paid controls whether a SALE is written to Bank (paid) or
+    Trade Debtors (outstanding). Ignored for PURCHASE documents.
     """
     # Persist confirmed document type
     await conn.execute(
@@ -278,13 +370,22 @@ async def _categorise_and_write(
     expense_categorised = expense_categorised.with_grossed_up_line_items()
 
     if doc_type == DocumentType.SALE:
-        entry_id = await journal_writer.write_sale(
-            conn=conn,
-            user_id=user_id,
-            document_id=document_id,
-            expense=expense_categorised,
-            auto_post=auto_post,
-        )
+        if sale_is_paid:
+            entry_id = await journal_writer.write_sale(
+                conn=conn,
+                user_id=user_id,
+                document_id=document_id,
+                expense=expense_categorised,
+                auto_post=auto_post,
+            )
+        else:
+            entry_id = await journal_writer.write_sale_on_credit(
+                conn=conn,
+                user_id=user_id,
+                document_id=document_id,
+                expense=expense_categorised,
+                auto_post=auto_post,
+            )
     else:
         entry_id = await journal_writer.write(
             conn=conn,
@@ -306,7 +407,7 @@ async def _categorise_and_write(
     )
 
     log.info(
-        "Document %s (%s) → journal entry %s (%s)",
-        document_id, doc_type, entry_id, final_doc_status,
+        "Document %s (%s, paid=%s) → journal entry %s (%s)",
+        document_id, doc_type, sale_is_paid, entry_id, final_doc_status,
     )
     return entry_id

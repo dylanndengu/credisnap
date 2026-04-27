@@ -415,3 +415,281 @@ async def write_sale(
             )
 
     return entry_id
+
+
+async def write_cash_sale(
+    conn: asyncpg.Connection,
+    user_id: UUID,
+    description: str,
+    gross_total: Decimal,
+    account_code: str,
+    vat_code: "VatCode",
+    entry_date: date,
+    confidence: float = 0.9,
+) -> UUID:
+    """
+    Write a journal entry for a cash sale recorded via text (no source document).
+
+    DR Bank Account (1020)       — full gross amount received
+    CR Revenue Account (4xxx)    — net amount
+    CR VAT Output Account (2100) — output VAT (if SR/ZR)
+
+    document_id is NULL — the schema permits this for manual entries.
+    Entry is always left as DRAFT for the user to confirm via YES/NO.
+    """
+    from decimal import ROUND_HALF_UP
+
+    vat_rate   = Decimal("0.15") if vat_code == VatCode.SR else Decimal("0.00")
+    net_amount = (gross_total / (1 + vat_rate)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    vat_amount = (gross_total - net_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    account_map = await _fetch_account_map(conn, user_id)
+
+    bank_id       = account_map.get("1020")
+    revenue_id    = account_map.get(account_code) or account_map.get("4020")
+    vat_output_id = account_map.get("2100")
+
+    if bank_id is None:
+        raise ValueError("Account 1020 (Business Bank Account) not found in Chart of Accounts")
+    if revenue_id is None:
+        raise ValueError(f"Account {account_code} not found in Chart of Accounts")
+    if vat_output_id is None:
+        raise ValueError("Account 2100 (VAT Output) not found in Chart of Accounts")
+
+    async with conn.transaction():
+
+        entry_id: UUID = await conn.fetchval(
+            """
+            INSERT INTO journal_entries
+                (user_id, document_id, entry_date, description,
+                 status, is_ai_generated, ai_confidence)
+            VALUES ($1, NULL, $2, $3, 'DRAFT', TRUE, $4)
+            RETURNING id
+            """,
+            user_id,
+            entry_date,
+            f"Cash Sale: {description}",
+            confidence,
+        )
+
+        # DR Bank — full gross received
+        await conn.execute(
+            """
+            INSERT INTO journal_entry_lines
+                (journal_entry_id, account_id, debit_amount, credit_amount, description, line_order)
+            VALUES ($1, $2, $3, 0, $4, 0)
+            """,
+            entry_id, bank_id, gross_total, "Cash received",
+        )
+
+        # CR Revenue — net amount
+        await conn.execute(
+            """
+            INSERT INTO journal_entry_lines
+                (journal_entry_id, account_id, debit_amount, credit_amount, description, line_order)
+            VALUES ($1, $2, 0, $3, $4, 1)
+            """,
+            entry_id, revenue_id, net_amount, description,
+        )
+
+        # CR VAT Output — only if SR/ZR and amount > 0
+        if vat_code.creates_vat_entry and vat_amount > 0:
+            vat_line_id: UUID = await conn.fetchval(
+                """
+                INSERT INTO journal_entry_lines
+                    (journal_entry_id, account_id, debit_amount, credit_amount,
+                     vat_amount, vat_code, description, line_order)
+                VALUES ($1, $2, 0, $3, $3, $4, 'VAT Output', 2)
+                RETURNING id
+                """,
+                entry_id, vat_output_id, vat_amount, vat_code.value,
+            )
+            await conn.execute(
+                """
+                INSERT INTO vat_entries
+                    (user_id, journal_entry_id, vat_journal_line_id, document_id,
+                     transaction_type, vat_code,
+                     net_amount, vat_amount, gross_amount, vat_rate,
+                     counterparty_name, counterparty_vat_number,
+                     invoice_number, tax_period)
+                VALUES
+                    ($1, $2, $3, NULL,
+                     'OUTPUT'::vat_transaction_type, $4::vat_code,
+                     $5, $6, $7, $8,
+                     NULL, NULL, NULL, $9)
+                """,
+                user_id, entry_id, vat_line_id, vat_code.value,
+                net_amount, vat_amount, gross_total, vat_rate,
+                _tax_period(entry_date),
+            )
+
+    log.info("Cash sale entry %s written (conf=%.2f)", entry_id, confidence)
+    return entry_id
+
+
+async def write_sale_on_credit(
+    conn: asyncpg.Connection,
+    user_id: UUID,
+    document_id: UUID,
+    expense: CategorisedExpense,
+    auto_post: bool = True,
+) -> UUID:
+    """
+    Write a journal entry for an unpaid sales invoice (income not yet received).
+
+    DR Trade Debtors (1110)     — gross total owed by the customer
+    CR Revenue Account (4xxx)   — net amount per line item
+    CR VAT Output Account (2100)— output VAT collected per line item
+
+    Raises:
+        ValueError  — if required accounts are missing or line items don't balance.
+        asyncpg.PostgresError — DB constraint violations.
+    """
+    if not expense.validate_line_totals():
+        log.warning(
+            "Credit sale line item sum (R%s) ≠ document gross (R%s) for document %s — "
+            "writing single-line DRAFT entry for manual review",
+            expense.line_items_gross_total, expense.gross_total, document_id,
+        )
+        from app.models.extraction import CategorisedLineItem
+        expense = expense.model_copy(update={
+            "line_items": [
+                CategorisedLineItem(
+                    description=f"Sales Invoice: {expense.invoice_number or expense.vendor_name or 'Unknown'}",
+                    account_code="4020",
+                    vat_code=VatCode.SR,
+                    gross_amount=expense.gross_total,
+                )
+            ],
+            "llm_confidence": 0.0,
+        })
+
+    account_map = await _fetch_account_map(conn, user_id)
+
+    debtors_account_id = account_map.get("1110")  # DR Trade Debtors
+    vat_output_id      = account_map.get("2100")  # CR VAT Output
+
+    if debtors_account_id is None:
+        raise ValueError("Account 1110 (Trade Debtors) not found in Chart of Accounts")
+    if vat_output_id is None:
+        raise ValueError("Account 2100 (VAT Output) not found in Chart of Accounts")
+
+    async with conn.transaction():
+
+        entry_id: UUID = await conn.fetchval(
+            """
+            INSERT INTO journal_entries
+                (user_id, document_id, entry_date, description,
+                 status, is_ai_generated, ai_confidence)
+            VALUES ($1, $2, $3, $4, 'DRAFT', TRUE, $5)
+            RETURNING id
+            """,
+            user_id,
+            document_id,
+            expense.document_date,
+            f"Sales Invoice (Credit): {expense.invoice_number or expense.vendor_name or 'Customer'}",
+            expense.combined_confidence,
+        )
+
+        line_order = 0
+
+        # DR Trade Debtors — full gross owed
+        await conn.execute(
+            """
+            INSERT INTO journal_entry_lines
+                (journal_entry_id, account_id, debit_amount, credit_amount,
+                 description, line_order)
+            VALUES ($1, $2, $3, 0, $4, $5)
+            """,
+            entry_id,
+            debtors_account_id,
+            expense.gross_total,
+            f"Debtor: {expense.invoice_number or 'Sales Invoice'}",
+            line_order,
+        )
+        line_order += 1
+
+        for item in expense.line_items:
+            if item.gross_amount <= 0:
+                continue
+
+            revenue_account_id = account_map.get(item.account_code) or account_map.get("4020")
+            if revenue_account_id is None:
+                raise ValueError("Account 4020 (Sales — Services) missing from Chart of Accounts")
+
+            await conn.execute(
+                """
+                INSERT INTO journal_entry_lines
+                    (journal_entry_id, account_id, debit_amount, credit_amount,
+                     description, line_order)
+                VALUES ($1, $2, 0, $3, $4, $5)
+                """,
+                entry_id,
+                revenue_account_id,
+                item.net_amount,
+                item.description,
+                line_order,
+            )
+            line_order += 1
+
+            if item.vat_code.creates_vat_entry and item.vat_amount > 0:
+                vat_line_id: UUID = await conn.fetchval(
+                    """
+                    INSERT INTO journal_entry_lines
+                        (journal_entry_id, account_id, debit_amount, credit_amount,
+                         vat_amount, vat_code, description, line_order)
+                    VALUES ($1, $2, 0, $3, $3, $4, $5, $6)
+                    RETURNING id
+                    """,
+                    entry_id,
+                    vat_output_id,
+                    item.vat_amount,
+                    item.vat_code.value,
+                    f"VAT Output: {item.description}",
+                    line_order,
+                )
+                line_order += 1
+
+                vat_rate = Decimal("0.15") if item.vat_code == VatCode.SR else Decimal("0.00")
+                await conn.execute(
+                    """
+                    INSERT INTO vat_entries
+                        (user_id, journal_entry_id, vat_journal_line_id, document_id,
+                         transaction_type, vat_code,
+                         net_amount, vat_amount, gross_amount, vat_rate,
+                         counterparty_name, counterparty_vat_number,
+                         invoice_number, tax_period)
+                    VALUES
+                        ($1, $2, $3, $4,
+                         'OUTPUT'::vat_transaction_type, $5::vat_code,
+                         $6, $7, $8, $9,
+                         $10, $11, $12, $13)
+                    """,
+                    user_id,
+                    entry_id,
+                    vat_line_id,
+                    document_id,
+                    item.vat_code.value,
+                    item.net_amount,
+                    item.vat_amount,
+                    item.gross_amount,
+                    vat_rate,
+                    expense.vendor_name,
+                    expense.vendor_vat_number,
+                    expense.invoice_number,
+                    _tax_period(expense.document_date),
+                )
+
+        if auto_post and expense.combined_confidence >= AUTO_POST_THRESHOLD:
+            await conn.execute(
+                "UPDATE journal_entries SET status = 'POSTED' WHERE id = $1",
+                entry_id,
+            )
+            log.info("Credit sale entry %s auto-posted (confidence=%.2f)", entry_id, expense.combined_confidence)
+        else:
+            log.info(
+                "Credit sale entry %s left as DRAFT (confidence=%.2f, auto_post=%s)",
+                entry_id, expense.combined_confidence, auto_post,
+            )
+
+    return entry_id

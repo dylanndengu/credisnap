@@ -52,10 +52,7 @@ def _make_conn(fetchrow=None, fetchval=None) -> AsyncMock:
 
 def _pool(conn: AsyncMock) -> AsyncMock:
     pool = AsyncMock()
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=conn)
-    cm.__aexit__ = AsyncMock(return_value=False)
-    pool.acquire = MagicMock(return_value=cm)  # sync call → context manager
+    pool.acquire = AsyncMock(return_value=conn)  # await pool.acquire() → conn
     return pool
 
 
@@ -285,7 +282,7 @@ async def test_yes_with_draft_posts_entry():
 
     msg = mock_twilio.send_whatsapp.call_args[0][1]
     assert "✅" in msg
-    assert "Fuel" in msg or "Posted" in msg
+    assert "Saved" in msg or "saved" in msg
 
 
 @pytest.mark.asyncio
@@ -307,12 +304,23 @@ async def test_yes_with_no_draft_sends_nothing_pending():
 
 
 @pytest.mark.asyncio
-async def test_no_with_draft_discards_entry():
-    """NO from onboarded user with a DRAFT → delete the journal entry."""
+async def test_no_with_draft_shows_edit_menu():
+    """NO from onboarded user with a DRAFT entry → show the structured edit menu."""
     user_id = uuid4()
     entry_id = uuid4()
-    user_row = {"id": user_id, "popia_consent_given": True, "onboarding_step": "DONE"}
-    conn = _make_conn(fetchrow=user_row, fetchval=entry_id)
+    user_row = {
+        "id": user_id, "popia_consent_given": True, "onboarding_step": "DONE",
+        "conversation_state": None,
+    }
+    entry_details = {
+        "vendor_name": "Engen Sandton", "gross_amount": 890,
+        "document_date": date(2026, 3, 28), "document_type": "PURCHASE",
+    }
+    # fetchrow sequence: user lookup, then entry summary, then category lookup
+    conn = _make_conn(
+        fetchrow=[user_row, entry_details, None],
+        fetchval=entry_id,
+    )
 
     with (
         _patch_pool(_pool(conn)),
@@ -321,11 +329,8 @@ async def test_no_with_draft_discards_entry():
         from app.whatsapp.message_handler import handle_message
         await handle_message(_form(body="NO"))
 
-    delete_calls = [c for c in conn.execute.call_args_list if "DELETE" in str(c)]
-    assert delete_calls, "Expected DELETE for discarded journal entry"
-
     msg = mock_twilio.send_whatsapp.call_args[0][1]
-    assert "🗑" in msg or "discard" in msg.lower() or "Discard" in msg
+    assert "wrong" in msg.lower() or "Wrong" in msg
 
 
 @pytest.mark.asyncio
